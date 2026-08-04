@@ -101,10 +101,9 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	c := o.c
 	c.maybeSessionStart(ctx)
 	parentSession := c.parentSessionID()
-	images := c.inputImages(raw)
+	resolvedImages := c.resolveInputImages(raw)
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	ctx = agent.WithUserImages(ctx, images)
 	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
 	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
 
@@ -127,6 +126,18 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 
+	// Route images once for this subagent turn (same rules as the main turn);
+	// the child never re-routes or re-describes inside its own loop.
+	route := c.routeImagesOnce(ctx, &ImageRouteState{}, input, raw, resolvedImages)
+	ctx = agent.WithUserImages(ctx, route.Images)
+	if route.Mode == ImageRouteDirectMain {
+		ctx = agent.WithDirectImageTurn(ctx, true)
+	}
+	input = route.Input
+	if route.Notice != "" {
+		c.emitImageRouteNotice(route.Notice)
+	}
+
 	c.markInFlightTurn(startMessages, true)
 	inFlight := true
 	defer func() {
@@ -138,7 +149,7 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	if c.executor == nil {
 		return fmt.Errorf("subagent slash invocation requires an active session")
 	}
-	c.executor.Session().Add(provider.Message{Role: provider.RoleUser, Content: input, Images: images, CreatedAt: time.Now().UnixMilli()})
+	c.executor.Session().Add(provider.Message{Role: provider.RoleUser, Content: input, Images: route.Images, CreatedAt: time.Now().UnixMilli()})
 
 	for _, sk := range skills {
 		sk = c.skills.prepare(sk)
@@ -181,8 +192,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	userImages := c.inputImages(turn.input)
-	ctx = agent.WithUserImages(ctx, userImages)
+	resolvedImages := c.resolveInputImages(turn.input)
 	ctx = agent.WithRawUserInput(ctx, turn.raw)
 	continuation := turn.goalContinuation
 	var input string
@@ -238,6 +248,20 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	}
 	autoResearchAcceptedBefore := c.autoResearchAcceptedEvidenceIDs(autoResearchTaskID)
 	c.appendAutoResearchHeartbeat(autoResearchTaskID, autoresearch.HeartbeatStartingTurn, "")
+	// Image routing runs exactly once per user turn, after UserPromptSubmit so a
+	// gating hook aborts before any model call (including the vision model), and
+	// before the capability route / main runner. The route decides whether the
+	// main model gets raw images (direct), a text description (vision fallback),
+	// or a path-only notice (degraded) — never a retry or a second route.
+	route := c.routeImagesOnce(ctx, &ImageRouteState{}, input, turn.raw, resolvedImages)
+	ctx = agent.WithUserImages(ctx, route.Images)
+	if route.Mode == ImageRouteDirectMain {
+		ctx = agent.WithDirectImageTurn(ctx, true)
+	}
+	input = route.Input
+	if route.Notice != "" {
+		c.emitImageRouteNotice(route.Notice)
+	}
 	modelInput := input
 	if !turn.synthetic {
 		modelInput = c.withCapabilityRoute(input, turn.raw)
@@ -277,7 +301,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 				c.stripCancelledVisibleTurnMessagesAfterWithFallback(startMessages, provider.Message{
 					Role:      provider.RoleUser,
 					Content:   input,
-					Images:    append([]string(nil), userImages...),
+					Images:    append([]string(nil), route.Images...),
 					CreatedAt: time.Now().UnixMilli(),
 				})
 			}
@@ -290,7 +314,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 			c.stripCancelledVisibleTurnMessagesAfterWithFallback(startMessages, provider.Message{
 				Role:      provider.RoleUser,
 				Content:   input,
-				Images:    append([]string(nil), userImages...),
+				Images:    append([]string(nil), route.Images...),
 				CreatedAt: time.Now().UnixMilli(),
 			})
 		}

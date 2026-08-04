@@ -51,6 +51,7 @@ import (
 	"reasonix/internal/tool"
 	"reasonix/internal/tool/builtin"
 	"reasonix/internal/tool/sessiontool"
+	"reasonix/internal/vision"
 	"reasonix/internal/workspacelease"
 )
 
@@ -864,6 +865,44 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// capRuntime is assigned after MCP specs load; closures capture the variable
 	// so task tools created later still receive the session-shared substrate.
 	var capRuntime *agent.MCPCapabilityRuntime
+	// Tool-image routing is assembled before the executor and task tools so
+	// every agent (executor, planner, task/parallel_tasks/fleet children)
+	// shares one vision model. visionDescriber is the configured vision_model
+	// fallback; toolImageProcessor routes tool-result images through it (or
+	// degrades to "could not read" when none is configured). Both are
+	// best-effort: a missing/unresolvable vision_model keeps tool images
+	// path/status-only at runtime instead of failing startup.
+	var (
+		visionDescriber    vision.Describer
+		toolImageProcessor vision.ToolImageProcessor
+		visionModelRef     string
+		// subagentSupportsImages resolves a sub-agent model ref's image-input
+		// capability locally ("" = parent model); assigned before the executor.
+		subagentSupportsImages func(modelRef string) bool
+	)
+	// Assemble the vision fallback before any task tool is constructed. TaskTool
+	// copies these values into its options; assigning them later would leave the
+	// already-registered task/parallel_tasks/fleet children permanently unwired.
+	visionModelRef = strings.TrimSpace(cfg.Agent.VisionModel)
+	if visionModelRef != "" {
+		if vEntry, ok := cfg.ResolveModel(visionModelRef); ok && config.EffectiveVision(vEntry) {
+			if vp, err := resolveProvider(opts, cfg, proxySpec, provider.Selection{Ref: visionModelRef}); err == nil {
+				visionDescriber = vision.NewProviderDescriber(vp, vEntry.Price, sink)
+				visionModelRef = modelRefFromEntry(vEntry)
+			}
+		}
+	}
+	toolImageProcessor = vision.NewToolImageProcessor(visionModelRef, visionDescriber, sink)
+	subagentSupportsImages = func(modelRef string) bool {
+		if strings.TrimSpace(modelRef) == "" {
+			return config.EffectiveVision(entry)
+		}
+		if resolved, ok := cfg.ResolveModel(modelRef); ok {
+			return config.EffectiveVision(resolved)
+		}
+		// Synthetic provider-resolver entries cannot declare vision reliably.
+		return false
+	}
 	newTaskTool := func() *agent.TaskTool {
 		return agent.NewTaskToolWithOptions(agent.TaskToolOptions{
 			Provider:            execProv,
@@ -884,6 +923,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			SubagentModel:       taskModel,
 			SubagentEffort:      taskEffort,
 			ResolveProvider:     resolveSubagentProvider,
+			ToolImages:          toolImageProcessor,
+			ModelSupportsImages: subagentSupportsImages,
 		}).
 			WithTranscripts(subagentStore, root, modelName, entry.Effort).
 			WithTranscriptIdentityResolver(subagentIdentity).
@@ -973,7 +1014,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// subagentSkillOptions is the single construction point for skill sub-agent
 	// run options, so the read-only and writer-capable runners cannot drift on
 	// compaction or language settings — add new fields here, not per runner.
-	subagentSkillOptions := func(sctx context.Context, steps int, price *provider.Pricing, ctxWin, childDepth int) agent.Options {
+	subagentSkillOptions := func(sctx context.Context, steps int, price *provider.Pricing, ctxWin, childDepth int, modelRef string) agent.Options {
 		return agent.Options{
 			MaxSteps:            steps,
 			Temperature:         cfg.Agent.Temperature,
@@ -994,9 +1035,15 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			MaxSubagentDepth:    maxSubagentDepth,
 			DeliveryProfile:     tokenDelivery,
 			WorkspaceLease:      workspaceLease,
+			ModelRef:            modelRef,
+			ToolImages:          toolImageProcessor,
+			ModelSupportsImages: subagentSupportsImages(modelRef),
 		}
 	}
 	readOnlySkillRunner := func(sctx context.Context, sk skill.Skill, task string, runOpts skill.SubagentRunOptions) (string, error) {
+		if !runOpts.HostInitiated {
+			sctx = agent.WithoutUserImages(sctx)
+		}
 		if strings.TrimSpace(runOpts.ContinueFrom) != "" || strings.TrimSpace(runOpts.ForkFrom) != "" {
 			return "", fmt.Errorf("read_only_skill does not support continue_from/fork_from")
 		}
@@ -1044,9 +1091,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		if sysPrompt == "" {
 			sysPrompt = agent.DefaultReadOnlyTaskSystemPrompt
 		}
-		runOptions := subagentSkillOptions(sctx, steps, price, ctxWin, childDepth)
 		usageModelRef, _ := subagentIdentity(modelRef, effortRef)
-		runOptions.ModelRef = usageModelRef
+		runOptions := subagentSkillOptions(sctx, steps, price, ctxWin, childDepth, usageModelRef)
 		// Delivery risk gates consume typed reports; outside Delivery a casual
 		// /review run may finish with prose only.
 		if runOptions.DeliveryProfile {
@@ -1061,6 +1107,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// per-skill model, and resumable transcripts when the parent session supports
 	// them. Its tool activity nests under the invoking call, like `task`.
 	skillRunner := func(sctx context.Context, sk skill.Skill, task string, runOpts skill.SubagentRunOptions) (string, error) {
+		if !runOpts.HostInitiated {
+			sctx = agent.WithoutUserImages(sctx)
+		}
 		// Writer skills without write_paths claim the whole workspace so they
 		// cannot race fleet/task writers that declared disjoint paths.
 		acq := agent.AcquireRequest{
@@ -1165,9 +1214,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				steps = 5
 			}
 		}
-		runOptions := subagentSkillOptions(sctx, steps, price, ctxWin, childDepth)
 		usageModelRef, _ := subagentIdentity(modelRef, effortRef)
-		runOptions.ModelRef = usageModelRef
+		runOptions := subagentSkillOptions(sctx, steps, price, ctxWin, childDepth, usageModelRef)
 		// Delivery risk gates consume typed reports; outside Delivery a casual
 		// /review run may finish with prose only.
 		if runOptions.DeliveryProfile {
@@ -1594,6 +1642,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		SubagentDepth:                0,
 		MaxSubagentDepth:             maxSubagentDepth,
 		MissingReasoningWarnStateDir: config.MissingReasoningWarnStateDir(),
+		ToolImages:                   toolImageProcessor,
+		ModelSupportsImages:          config.EffectiveVision(entry),
 	}, sink)
 
 	var runner agent.Runner = executor
@@ -1643,11 +1693,20 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				CapabilityLedger:             plannerLedger,
 				CapabilityAudit:              plannerAudit,
 				MissingReasoningWarnStateDir: config.MissingReasoningWarnStateDir(),
+				ToolImages:                   toolImageProcessor,
+				ModelSupportsImages:          config.EffectiveVision(pe),
 			}
 			runner = agent.NewCoordinatorWithPlannerPolicy(plannerProv, plannerSess, pe.Price, plannerTools, plannerOpts, executor, cfg.Agent.Temperature, sink, control.NewPlannerPolicy())
 			label = entry.Model + " + planner " + pe.Model
 		}
 	}
+
+	// Vision fallback for the main session: when the main model cannot read
+	// images, the configured vision_model turns attachments into text via up to
+	// three tool-less requests. Assembly happened before the executor so the
+	// same describer backs the tool-image processor; this is best-effort — a
+	// missing/unresolvable model keeps images path-only at runtime instead of
+	// failing startup.
 
 	ctrlOpts := control.Options{
 		Runner:                runner,
@@ -1657,6 +1716,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		SubagentGate:          headlessGate,
 		Label:                 label,
 		ModelRef:              modelRef,
+		VisionModelRef:        strings.TrimSpace(cfg.Agent.VisionModel),
+		VisionDescriber:       visionDescriber,
 		SystemPrompt:          sysPrompt,
 		SessionDir:            sessionDir,
 		Host:                  pluginHost,

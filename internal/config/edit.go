@@ -571,6 +571,7 @@ func (c *Config) RemoveProvider(name string) error {
 	defaultRefsProvider := c.modelRefTargetsProvider(c.DefaultModel, name)
 	plannerRefsProvider := c.modelRefTargetsProvider(c.Agent.PlannerModel, name)
 	subagentRefsProvider := c.modelRefTargetsProvider(c.Agent.SubagentModel, name)
+	visionRefsProvider := c.modelRefTargetsProvider(c.Agent.VisionModel, name)
 	subagentModelRefsProvider := map[string]bool{}
 	for skill, ref := range c.Agent.SubagentModels {
 		if c.modelRefTargetsProvider(ref, name) {
@@ -579,7 +580,7 @@ func (c *Config) RemoveProvider(name string) error {
 	}
 
 	fallback := ""
-	if defaultRefsProvider || plannerRefsProvider || subagentRefsProvider || len(subagentModelRefsProvider) > 0 {
+	if defaultRefsProvider || plannerRefsProvider || subagentRefsProvider || visionRefsProvider || len(subagentModelRefsProvider) > 0 {
 		fallback = c.providerRemovalFallback(name)
 	}
 	if defaultRefsProvider && fallback == "" {
@@ -596,6 +597,9 @@ func (c *Config) RemoveProvider(name string) error {
 	}
 	if subagentRefsProvider {
 		c.Agent.SubagentModel = fallback
+	}
+	if visionRefsProvider {
+		c.Agent.VisionModel = fallback
 	}
 	for skill := range subagentModelRefsProvider {
 		if fallback != "" {

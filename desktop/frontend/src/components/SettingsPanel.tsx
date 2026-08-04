@@ -4092,6 +4092,7 @@ function ModelsSection({ s, busy, apply, backgroundApply, initialFocus }: Models
   const refs = useMemo(() => allRefs(s), [s.providers]);
   const defaultRef = toRef(s.defaultModel, s);
   const plannerRef = toRef(s.plannerModel, s);
+  const visionRef = toRef(s.visionModel, s);
   const subagentRef = toRef(s.subagentModel, s);
   const plannerSelectRef = plannerRef === defaultRef ? "" : plannerRef;
   const [defaultProvider] = defaultRef.split("/");
@@ -4303,6 +4304,18 @@ function ModelsSection({ s, busy, apply, backgroundApply, initialFocus }: Models
                 disabled={busy}
                 includeSameDefault
                 onPick={(ref) => void apply(() => app.SetPlannerModel(ref))}
+              />
+            </SettingsField>
+
+            <SettingsField label={t("settings.visionModelPicker")} hint={t("settings.visionModelPickerHint")}>
+              <ModelPicker
+                s={s}
+                refs={refs}
+                value={visionRef}
+                disabled={busy}
+                emptyOptionLabel={t("settings.visionModelPickerNone")}
+                emptyOptionHint={t("settings.visionModelPickerNoneHint")}
+                onPick={(ref) => void apply(() => app.SetVisionModel(ref))}
               />
             </SettingsField>
 
@@ -5696,7 +5709,7 @@ function ProviderModelDraftPicker({
                   disabled={disabled || !enabled}
                   onChange={() => onToggleVision(model)}
                 />
-                <span>{t("settings.visionModel")}</span>
+                <span>{t("settings.visionModelPicker")}</span>
               </label>
             </div>
           );
@@ -5932,7 +5945,7 @@ export const ProviderEditorModelPicker = memo(function ProviderEditorModelPicker
                   disabled={disabled || !enabled}
                   onChange={() => onToggleVision(model)}
                 />
-                <span>{t("settings.visionModel")}</span>
+                <span>{t("settings.visionModelPicker")}</span>
               </label>
               <div className="provider-model-draft__context-field">
                 <label className="provider-model-draft__context">

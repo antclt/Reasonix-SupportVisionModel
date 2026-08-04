@@ -16,6 +16,7 @@ import (
 	"golang.org/x/text/transform"
 
 	fileenc "reasonix/internal/fileutil/encoding"
+	"reasonix/internal/imagedata"
 	"reasonix/internal/tool"
 )
 
@@ -48,14 +49,14 @@ const (
 func (readFile) Name() string { return "read_file" }
 
 func (readFile) Description() string {
-	return "Read a text file with optional line offset/limit. Output prefixes each line with its 1-based number (e.g. `   42→...`) so subsequent edit_file calls can target exact lines. Use `offset` and `limit` to page through large files; the tool reports total length and pagination hints in a trailer."
+	return "Read a text file or a supported image file (PNG, JPEG, GIF, or WebP). Image files are returned through structured image content so the current multimodal model, or the configured vision fallback, can inspect the actual pixels. When a shell command, archive extraction, folder listing, or document extraction produces image paths that must be visually inspected, call read_file on the actual image files; printing paths, sizes, or dimensions does not expose image content. Text output prefixes each line with its 1-based number (e.g. `   42→...`) so subsequent edit_file calls can target exact lines. Use `offset` and `limit` to page through large text files; the tool reports total length and pagination hints in a trailer."
 }
 
 func (readFile) Schema() json.RawMessage {
 	return json.RawMessage(`{
 "type":"object",
 "properties":{
-  "path":{"type":"string","description":"File path"},
+  "path":{"type":"string","description":"Path to a text file or a supported PNG/JPEG/GIF/WebP image file"},
   "offset":{"type":"integer","description":"0-based line offset to start reading from (default 0)","minimum":0},
   "limit":{"type":"integer","description":"Maximum lines to return (default 2000)","minimum":1}
 },
@@ -72,16 +73,27 @@ func (readFile) SnipHint() tool.SnipHint {
 }
 
 func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	text, _, err := r.ExecuteWithImages(ctx, args)
+	return text, err
+}
+
+// ExecuteWithImages implements tool.ImageTool: text files behave exactly like
+// Execute (images nil), while PNG/JPEG/GIF/WebP files return a short text
+// summary plus the image as a data URL. The base64 payload never enters the
+// tool text — the output-truncation budget would corrupt it and it would bloat
+// the context — it rides the structured Images channel instead. Any other
+// binary keeps the historical error.
+func (r readFile) ExecuteWithImages(ctx context.Context, args json.RawMessage) (string, []string, error) {
 	var p struct {
 		Path   string `json:"path"`
 		Offset int    `json:"offset,omitempty"`
 		Limit  int    `json:"limit,omitempty"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
-		return "", fmt.Errorf("invalid args: %w", err)
+		return "", nil, fmt.Errorf("invalid args: %w", err)
 	}
 	if p.Path == "" {
-		return "", fmt.Errorf("path is required")
+		return "", nil, fmt.Errorf("path is required")
 	}
 	rp := resolveReadablePath(r.workDir, p.Path, r.paths)
 	p.Path = rp.Path
@@ -89,9 +101,9 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 	if confineRead(r.forbidRoots, p.Path) {
 		err := &os.PathError{Op: "open", Path: p.Path, Err: os.ErrNotExist}
 		if rp.External {
-			return "", fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(err))
+			return "", nil, fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(err))
 		}
-		return "", err
+		return "", nil, err
 	}
 	if p.Offset < 0 {
 		p.Offset = 0
@@ -105,7 +117,8 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 	// and binary-detection pipeline below applies to the disk fallback only.
 	if r.overlay != nil && !rp.External && filepath.IsAbs(p.Path) {
 		if content, ok := r.overlay.ReadTextFile(ctx, p.Path); ok {
-			return r.scan(strings.NewReader(content), p.Offset, p.Limit)
+			text, serr := r.scan(strings.NewReader(content), p.Offset, p.Limit)
+			return text, nil, serr
 		}
 	}
 
@@ -113,15 +126,15 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 	// an actionable message (and avoid the doubled "read X: read X:" the scanner's
 	// error would otherwise produce) so the model switches to the ls tool.
 	if info, err := os.Stat(p.Path); err == nil && info.IsDir() {
-		return "", fmt.Errorf("%s is a directory, not a file — use the ls tool to list it, or read a specific file inside it", displayPath)
+		return "", nil, fmt.Errorf("%s is a directory, not a file — use the ls tool to list it, or read a specific file inside it", displayPath)
 	}
 
 	f, err := os.Open(p.Path)
 	if err != nil {
 		if rp.External {
-			return "", fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(err))
+			return "", nil, fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(err))
 		}
-		return "", fmt.Errorf("read %s: %w", displayPath, err)
+		return "", nil, fmt.Errorf("read %s: %w", displayPath, err)
 	}
 	defer f.Close()
 
@@ -133,6 +146,16 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 	peek = peek[:pn]
 	peekEOF := perr != nil // whole file fit in the peek (EOF / ErrUnexpectedEOF)
 
+	// A NUL-carrying payload that sniffs as a supported image is returned as
+	// structured image output instead of a binary error — this is the seam
+	// where read_file learns to read workspace screenshots and diagrams. The
+	// check runs before the text pipeline (and independent of the NUL probe)
+	// so even an image whose first bytes are NUL-free is never mis-scanned as
+	// text.
+	if mime := imagedata.DetectMIME(peek); mime != "" {
+		return r.readImage(f, peek, displayPath)
+	}
+
 	// BOM check first: UTF-16 files contain 0x00 for every ASCII character, so a
 	// naive NUL check would misidentify them as binary.
 	switch fileenc.DetectQuick(peek) {
@@ -142,20 +165,22 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 		rest, rerr := io.ReadAll(f)
 		if rerr != nil {
 			if rp.External {
-				return "", fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(rerr))
+				return "", nil, fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(rerr))
 			}
-			return "", fmt.Errorf("read %s: %w", displayPath, rerr)
+			return "", nil, fmt.Errorf("read %s: %w", displayPath, rerr)
 		}
 		all := append(peek, rest...)
 		bom := fileenc.DetectQuick(all)
-		return r.scan(bytes.NewReader(fileenc.Decode(all, bom)), p.Offset, p.Limit)
+		text, serr := r.scan(bytes.NewReader(fileenc.Decode(all, bom)), p.Offset, p.Limit)
+		return text, nil, serr
 	case fileenc.UTF8BOM:
 		// Strip the 3-byte BOM; the content is valid UTF-8 and streams directly.
 		body := peek
 		if len(body) >= 3 {
 			body = body[3:]
 		}
-		return r.scan(io.MultiReader(bytes.NewReader(body), f), p.Offset, p.Limit)
+		text, serr := r.scan(io.MultiReader(bytes.NewReader(body), f), p.Offset, p.Limit)
+		return text, nil, serr
 	}
 
 	// BOM-less UTF-16 (Windows source files) has a NUL for every ASCII char but
@@ -165,19 +190,20 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 		rest, rerr := io.ReadAll(f)
 		if rerr != nil {
 			if rp.External {
-				return "", fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(rerr))
+				return "", nil, fmt.Errorf("read %s: %s", displayPath, rp.ErrorText(rerr))
 			}
-			return "", fmt.Errorf("read %s: %w", displayPath, rerr)
+			return "", nil, fmt.Errorf("read %s: %w", displayPath, rerr)
 		}
 		all := append(peek, rest...)
-		return r.scan(bytes.NewReader(fileenc.Decode(all, k)), p.Offset, p.Limit)
+		text, serr := r.scan(bytes.NewReader(fileenc.Decode(all, k)), p.Offset, p.Limit)
+		return text, nil, serr
 	}
 
 	if bytes.IndexByte(peek, 0) >= 0 {
 		if rp.External {
-			return "", fmt.Errorf("binary file %s (NUL byte detected); not shown by read_file", displayPath)
+			return "", nil, fmt.Errorf("binary file %s (NUL byte detected); not shown by read_file", displayPath)
 		}
-		return "", fmt.Errorf("binary file %s (NUL byte detected); use `bash hexdump` or another tool", displayPath)
+		return "", nil, fmt.Errorf("binary file %s (NUL byte detected); use `bash hexdump` or another tool", displayPath)
 	}
 
 	// Read up to a bounded sample for encoding detection, then stream the rest —
@@ -203,9 +229,51 @@ func (r readFile) Execute(ctx context.Context, args json.RawMessage) (string, er
 
 	src := io.MultiReader(bytes.NewReader(head), f)
 	if dec := fileenc.Decoder(enc); dec != nil {
-		return r.scan(transform.NewReader(src, dec), p.Offset, p.Limit)
+		text, serr := r.scan(transform.NewReader(src, dec), p.Offset, p.Limit)
+		return text, nil, serr
 	}
-	return r.scan(src, p.Offset, p.Limit)
+	text, serr := r.scan(src, p.Offset, p.Limit)
+	return text, nil, serr
+}
+
+// readImage turns an already-opened image file into a short text summary plus
+// one data URL. f is positioned after the peek bytes; raw content is assembled
+// from peek + the remainder. The text stays small and path-relative; the image
+// bytes travel only in the structured Images result so the tool-text truncation
+// budget can never corrupt a base64 payload. The stat/read re-stat sequence
+// detects a file swapped or modified mid-read.
+func (r readFile) readImage(f *os.File, peek []byte, displayPath string) (string, []string, error) {
+	before, err := f.Stat()
+	if err != nil {
+		return "", nil, fmt.Errorf("read %s: %w", displayPath, err)
+	}
+	if before.Size() > imagedata.MaxBytes {
+		return "", nil, fmt.Errorf("image %s exceeds 10 MB limit", displayPath)
+	}
+	rest, rerr := io.ReadAll(io.LimitReader(f, imagedata.MaxBytes+1))
+	if rerr != nil {
+		return "", nil, fmt.Errorf("read %s: %w", displayPath, rerr)
+	}
+	raw := make([]byte, 0, len(peek)+len(rest))
+	raw = append(raw, peek...)
+	raw = append(raw, rest...)
+	if len(raw) > imagedata.MaxBytes {
+		return "", nil, fmt.Errorf("image %s exceeds 10 MB limit", displayPath)
+	}
+	after, aerr := f.Stat()
+	if aerr != nil {
+		return "", nil, fmt.Errorf("read %s: %w", displayPath, aerr)
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() {
+		return "", nil, fmt.Errorf("image %s changed while reading; re-read it", displayPath)
+	}
+	img := imagedata.Decode(raw)
+	if img.MIME == "" {
+		// Content no longer matches a supported image (spoofed extension).
+		return "", nil, fmt.Errorf("binary file %s (not a supported image); use `bash hexdump` or another tool", displayPath)
+	}
+	text := fmt.Sprintf("已读取图片文件：%s\n格式：%s\n大小：%d bytes", displayPath, img.MIME, len(raw))
+	return text, []string{imagedata.DataURL(img.Raw, img.MIME)}, nil
 }
 
 // scan reads lines from src and returns the formatted output with line numbers.

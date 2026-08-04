@@ -7166,7 +7166,12 @@ func (a *App) imageInputEnabledForTab(tabID string) bool {
 		return false
 	}
 	entry, ok := cfg.ResolveModel(ref)
-	return ok && config.EffectiveVision(entry)
+	if ok && config.EffectiveVision(entry) {
+		return true
+	}
+	// A configured vision fallback still allows attaching images: the router
+	// describes them with that model when the main model cannot read them.
+	return strings.TrimSpace(cfg.Agent.VisionModel) != ""
 }
 
 func (a *App) MetaForTab(tabID string) Meta {

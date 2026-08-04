@@ -65,6 +65,44 @@ type requestAttemptCounter struct {
 	count atomic.Int64
 }
 
+// maxRetriesKey carries a per-request retry budget override. SendWithRetry and
+// provider-side reconnect loops consult it; a value of 0 means "exactly one
+// HTTP attempt, no retry", which the vision describer uses so the outer
+// tool-image router owns the full retry policy (at most three requests).
+type maxRetriesKey struct{}
+
+// WithMaxRetries caps the number of *retries* SendWithRetry (and provider
+// reconnect loops) may perform after the initial attempt, overriding MaxRetries
+// for this request. max < 0 restores the default. The vision describer passes
+// 0 so one DescribeOnce call maps to exactly one HTTP request.
+func WithMaxRetries(ctx context.Context, max int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, maxRetriesKey{}, max)
+}
+
+// MaxRetriesFromContext returns the retry budget override attached by
+// WithMaxRetries and whether one is present.
+func MaxRetriesFromContext(ctx context.Context) (max int, ok bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	max, ok = ctx.Value(maxRetriesKey{}).(int)
+	return max, ok
+}
+
+// requestRetryLimit resolves the retry budget for one request: the context
+// override when present and non-negative, otherwise the package default. A
+// negative override means "restore the default", so -1 never yields a
+// zero-attempt request.
+func requestRetryLimit(ctx context.Context) int {
+	if max, ok := MaxRetriesFromContext(ctx); ok && max >= 0 {
+		return max
+	}
+	return MaxRetries
+}
+
 // WithRetryNotify attaches a callback that SendWithRetry invokes before each
 // backoff sleep, so the agent can surface a transient "retrying (n/m)" status.
 func WithRetryNotify(ctx context.Context, fn RetryNotify) context.Context {
@@ -268,15 +306,16 @@ func readErrorBody(resp *http.Response) []byte {
 // failures are not retried (the model has already emitted tokens).
 func SendWithRetry(ctx context.Context, httpClient *http.Client, opts SendOptions, newReq func(context.Context) (*http.Request, error)) (*http.Response, error) {
 	notify := retryNotifyFromContext(ctx)
+	maxRetries := requestRetryLimit(ctx)
 	var lastErr error
 	var retryAfter time.Duration
 	authRetries := 0
 
-	for attempt := 0; attempt <= MaxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			delay := backoffDelay(attempt, retryAfter)
 			if notify != nil {
-				notify(RetryInfo{Attempt: attempt, Max: MaxRetries, Delay: delay, Err: lastErr})
+				notify(RetryInfo{Attempt: attempt, Max: maxRetries, Delay: delay, Err: lastErr})
 			}
 			select {
 			case <-ctx.Done():
@@ -308,7 +347,11 @@ func SendWithRetry(ctx context.Context, httpClient *http.Client, opts SendOption
 
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			authErr := &AuthError{Provider: opts.Provider, KeyEnv: opts.KeyEnv, KeySource: opts.KeySource, Status: resp.StatusCode, HasKey: opts.KeyPresent, Body: strings.TrimSpace(string(msg))}
-			if opts.RetryAuth && authRetries < maxAuthRetries {
+			// Respect an explicit per-request retry budget: when WithMaxRetries
+			// pinned the request to a single attempt (vision), a transient auth
+			// rejection must not smuggle in extra HTTP calls. requestRetryLimit
+			// never yields a negative budget, so this is the only gate needed.
+			if opts.RetryAuth && authRetries < maxAuthRetries && authRetries < maxRetries {
 				authRetries++
 				lastErr = authErr
 				continue

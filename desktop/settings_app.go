@@ -277,6 +277,7 @@ type BotSettingsView struct {
 type SettingsView struct {
 	DefaultModel            string               `json:"defaultModel"`
 	PlannerModel            string               `json:"plannerModel"`
+	VisionModel             string               `json:"visionModel"`
 	SubagentModel           string               `json:"subagentModel"`
 	SubagentEffort          string               `json:"subagentEffort"`
 	AutoPlan                string               `json:"autoPlan"`
@@ -999,6 +1000,7 @@ func (a *App) Settings() SettingsView {
 	v := SettingsView{
 		DefaultModel:      cfg.DefaultModel,
 		PlannerModel:      cfg.Agent.PlannerModel,
+		VisionModel:       cfg.Agent.VisionModel,
 		SubagentModel:     cfg.Agent.SubagentModel,
 		SubagentEffort:    cfg.Agent.SubagentEffort,
 		AutoPlan:          "off", // deprecated JSON compatibility for older frontends
@@ -1921,6 +1923,24 @@ func (a *App) SetPlannerModel(ref string) error {
 			ref = resolved
 		}
 		c.Agent.PlannerModel = ref
+		return nil
+	})
+}
+
+// SetVisionModel sets (or clears) the model used to describe attached images as
+// text when the main model does not support vision. Any configured model ref is
+// accepted; whether it actually supports vision is judged at runtime.
+func (a *App) SetVisionModel(ref string) error {
+	return a.applyConfigChange(func(c *config.Config) error {
+		ref = strings.TrimSpace(ref)
+		if ref != "" {
+			resolved, err := selectableDesktopModelRef(c, ref)
+			if err != nil {
+				return err
+			}
+			ref = resolved
+		}
+		c.Agent.VisionModel = ref
 		return nil
 	})
 }

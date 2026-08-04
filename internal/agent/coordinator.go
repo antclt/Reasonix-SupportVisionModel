@@ -350,18 +350,39 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 	if c.plannerPolicy != nil {
 		decision = normalizePlannerDecision(c.plannerPolicy(ctx, input))
 	}
+	// Direct-image turns never enter the dedicated planner because it cannot see
+	// raw images. Automatic work runs on the executor directly; explicit
+	// PlanOnly / PlanForApproval boundaries use the executor provider for a
+	// tool-less image-aware planning call below.
+	if decision.Route == PlannerRoutePlanAndExecute && DirectImageTurn(ctx) {
+		decision.Route = PlannerRouteExecutorOnly
+		decision.Reason = "direct_image_turn"
+	}
 	routeDetail := fmt.Sprintf("planner route=%s depth=%s reason=%s", decision.Route, decision.Depth, decision.Reason)
 	if decision.Route == PlannerRouteExecutorOnly {
 		c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing", Detail: routeDetail, Source: event.UsageSourceExecutor})
 		return c.executor.Run(ctx, input)
 	}
-	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.planner.Name() + " · planning", Detail: routeDetail, Source: event.UsageSourcePlanner})
+	directImagePlan := DirectImageTurn(ctx)
+	plannerName := c.planner.Name()
+	plannerSource := event.UsageSourcePlanner
+	if directImagePlan {
+		plannerName = c.executor.prov.Name()
+		plannerSource = event.UsageSourceExecutor
+	}
+	c.sink.Emit(event.Event{Kind: event.Phase, Text: plannerName + " · planning", Detail: routeDetail, Source: plannerSource})
 	plannerCtx := ctx
 	if decision.MaxResearchRounds > 0 {
 		plannerCtx = withRunStepLimit(plannerCtx, decision.MaxResearchRounds, "planner research rounds")
 	}
 	plannerInput := plannerTurnInput(input, decision)
-	plan, err := c.plan(plannerCtx, plannerInput)
+	var plan string
+	var err error
+	if directImagePlan {
+		plan, err = c.planDirectImage(plannerCtx, plannerInput)
+	} else {
+		plan, err = c.plan(plannerCtx, plannerInput)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("planner: %w", err)
@@ -459,6 +480,59 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		}
 	}
 	return runExecutorWithPlan(ctx, plan)
+}
+
+// planDirectImage asks the image-capable executor provider for a plan without
+// exposing tools or entering the dedicated planner session. This preserves
+// explicit no-execution/approval boundaries while ensuring the plan can see
+// the same raw images as the main model.
+func (c *Coordinator) planDirectImage(ctx context.Context, input string) (string, error) {
+	if c == nil || c.executor == nil || c.executor.prov == nil {
+		return "", fmt.Errorf("image-aware planner is unavailable")
+	}
+	messages := make([]provider.Message, 0, 2)
+	if strings.TrimSpace(c.plannerSystem) != "" {
+		messages = append(messages, provider.Message{Role: provider.RoleSystem, Content: c.plannerSystem})
+	}
+	messages = append(messages, provider.Message{
+		Role:    provider.RoleUser,
+		Content: input,
+		Images:  append([]string(nil), userImages(ctx)...),
+	})
+	ch, err := c.executor.prov.Stream(ctx, provider.Request{
+		Messages:    provider.ModelMessages(messages),
+		Temperature: provider.OptionalTemperature(c.temperature),
+	})
+	if err != nil {
+		return "", err
+	}
+	var text strings.Builder
+	var usage *provider.Usage
+	for chunk := range ch {
+		switch chunk.Type {
+		case provider.ChunkText:
+			text.WriteString(chunk.Text)
+			c.sink.Emit(event.Event{Kind: event.Text, Text: chunk.Text, Source: event.UsageSourceExecutor})
+		case provider.ChunkToolCallStart, provider.ChunkToolCallArgsDelta, provider.ChunkToolCall:
+			return "", fmt.Errorf("image-aware planner returned an unexpected tool call")
+		case provider.ChunkUsage:
+			usage = chunk.Usage
+		case provider.ChunkError:
+			if chunk.Err != nil {
+				return "", chunk.Err
+			}
+			return "", fmt.Errorf("image-aware planner stream failed")
+		}
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	c.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: c.executor.pricing, Source: event.UsageSourceExecutor, UsageSource: event.UsageSourceExecutor})
+	plan := strings.TrimSpace(text.String())
+	if plan == "" {
+		return "", fmt.Errorf("image-aware planner finished without producing a plan")
+	}
+	return plan, nil
 }
 
 // Persisted-session notes and user-facing notices for planner turns that ended

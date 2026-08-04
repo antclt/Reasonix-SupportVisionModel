@@ -53,6 +53,7 @@ import (
 	"reasonix/internal/skill"
 	"reasonix/internal/store"
 	"reasonix/internal/tool"
+	"reasonix/internal/vision"
 	"reasonix/internal/workspacelease"
 )
 
@@ -91,11 +92,17 @@ type Controller struct {
 	// one — sub-agents then keep whatever gate they were constructed with.
 	subagentGate *SharedHeadlessGate
 
-	label        string
-	modelRef     string
-	systemPrompt string
-	sessionDir   string
-	commands     atomic.Pointer[[]command.Command]
+	label    string
+	modelRef string
+	// visionModelRef names the configured model that turns attachments into
+	// text when the main model lacks vision; visionDescriber executes each
+	// bounded attempt. Both are set at boot from Options; empty disables the
+	// fallback route (images stay path-only).
+	visionModelRef  string
+	visionDescriber vision.Describer
+	systemPrompt    string
+	sessionDir      string
+	commands        atomic.Pointer[[]command.Command]
 	// skills owns the session's discovered skills (enabled subset, full set, and
 	// the reloadable stores) — the skills slice of the Capabilities concern. See
 	// skill.go.
@@ -381,18 +388,24 @@ type Options struct {
 	// SetToolApprovalMode and ApplyHeadlessApprovalMode call Update on it so a
 	// runtime approval-mode switch reaches sub-agents, not just the parent
 	// executor's own gate.
-	SubagentGate  *SharedHeadlessGate
-	Label         string
-	ModelRef      string
-	SystemPrompt  string
-	SessionDir    string
-	SessionPath   string
-	Host          *plugin.Host
-	Commands      []command.Command
-	Skills        []skill.Skill
-	AllSkills     []skill.Skill
-	SkillStore    *skill.Store
-	AllSkillStore *skill.Store
+	SubagentGate *SharedHeadlessGate
+	Label        string
+	ModelRef     string
+	// VisionModelRef optionally names an already-configured model used to
+	// describe attached images when the main model has no vision support.
+	// VisionDescriber performs each tool-less attempt; nil disables
+	// the fallback route.
+	VisionModelRef  string
+	VisionDescriber vision.Describer
+	SystemPrompt    string
+	SessionDir      string
+	SessionPath     string
+	Host            *plugin.Host
+	Commands        []command.Command
+	Skills          []skill.Skill
+	AllSkills       []skill.Skill
+	SkillStore      *skill.Store
+	AllSkillStore   *skill.Store
 	// SkillRunner executes a runAs=subagent skill in an isolated child loop.
 	// ReadOnlySkillRunner is reserved for explicitly read-only entry points;
 	// Plan itself is a workflow instruction and uses SkillRunner with the shared
@@ -497,6 +510,8 @@ func New(opts Options) *Controller {
 		subagentGate:                      opts.SubagentGate,
 		label:                             opts.Label,
 		modelRef:                          opts.ModelRef,
+		visionModelRef:                    opts.VisionModelRef,
+		visionDescriber:                   opts.VisionDescriber,
 		systemPrompt:                      opts.SystemPrompt,
 		sessionDir:                        opts.SessionDir,
 		sessionPath:                       opts.SessionPath,
@@ -1644,7 +1659,7 @@ func (c *Controller) Run(ctx context.Context, input string) (err error) {
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	ctx = agent.WithUserImages(ctx, c.inputImages(input))
+	resolvedImages := c.resolveInputImages(input)
 	rawInput := input
 	ctx = agent.WithRawUserInput(ctx, rawInput)
 	input = c.Compose(input)
@@ -1666,6 +1681,15 @@ func (c *Controller) Run(ctx context.Context, input string) (err error) {
 	}
 	c.markInFlightTurn(startMessages, true)
 	defer c.clearInFlightTurn()
+	route := c.routeImagesOnce(ctx, &ImageRouteState{}, input, rawInput, resolvedImages)
+	ctx = agent.WithUserImages(ctx, route.Images)
+	if route.Mode == ImageRouteDirectMain {
+		ctx = agent.WithDirectImageTurn(ctx, true)
+	}
+	input = route.Input
+	if route.Notice != "" {
+		c.emitImageRouteNotice(route.Notice)
+	}
 	ctx = c.withPlannerTurnMetadata(ctx, rawInput, false, startMessages)
 	err = c.runner.Run(ctx, c.withCapabilityRoute(input, rawInput))
 	return err
@@ -1705,11 +1729,20 @@ func (c *Controller) RunSubagentProfile(ctx context.Context, name, task string, 
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	ctx = agent.WithUserImages(ctx, c.inputImages(task))
 	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
 	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
 	ctx = agent.WithSubagentDepth(ctx, 0)
-	answer, err := runner(ctx, sk, task, skill.SubagentRunOptions{HostInitiated: true})
+	// Route images once for this subagent turn; the child never re-describes.
+	resolvedImages := c.resolveInputImages(task)
+	route := c.routeImagesOnce(ctx, &ImageRouteState{}, task, task, resolvedImages)
+	ctx = agent.WithUserImages(ctx, route.Images)
+	if route.Mode == ImageRouteDirectMain {
+		ctx = agent.WithDirectImageTurn(ctx, true)
+	}
+	if route.Notice != "" {
+		c.emitImageRouteNotice(route.Notice)
+	}
+	answer, err := runner(ctx, sk, route.Input, skill.SubagentRunOptions{HostInitiated: true})
 	if err != nil {
 		return "", err
 	}
@@ -5036,9 +5069,16 @@ func (c *Controller) imageInputEnabled() bool {
 	return ok && config.EffectiveVision(entry)
 }
 
-// ImageInputEnabled reports whether the current model accepts direct image
-// inputs, so frontends can gate image-only UX before a turn starts.
-func (c *Controller) ImageInputEnabled() bool { return c.imageInputEnabled() }
+// ImageInputEnabled reports whether the current session has any image-input
+// capability: the main model accepts images directly, or a vision fallback
+// model is configured to describe them. Frontends use it to decide whether to
+// allow attaching images at all; the per-turn router makes the final choice.
+// Note: a configured vision_model that is missing or lacks vision support still
+// reports true here — the frontend lets the user attach, and the router degrades
+// to a path-only notice instead of blocking the turn.
+func (c *Controller) ImageInputEnabled() bool {
+	return c.imageInputEnabled() || c.visionModelRefOr() != ""
+}
 
 // InheritLifecycleFrom carries same-session lifecycle state across controller
 // rebuilds, such as model switches that preserve the conversation.

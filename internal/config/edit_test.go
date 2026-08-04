@@ -2992,3 +2992,17 @@ func TestBrokenProjectConfigSymlinkFailsLoadAndSave(t *testing.T) {
 		t.Fatal("failed operations replaced the broken project config symlink")
 	}
 }
+
+func TestRemoveProviderClearsVisionModel(t *testing.T) {
+	c := Default()
+	c.Agent.VisionModel = "deepseek-pro"
+
+	// Removing the provider referenced by vision_model clears the field
+	// (fallback is empty when no other provider is configured).
+	if err := c.RemoveProvider("deepseek-pro"); err != nil {
+		t.Fatalf("remove vision provider: %v", err)
+	}
+	if c.Agent.VisionModel != "" {
+		t.Errorf("vision_model should be cleared, got %q", c.Agent.VisionModel)
+	}
+}

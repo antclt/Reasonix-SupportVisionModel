@@ -656,6 +656,14 @@ const maxStreamReconnects = 3
 // would duplicate output, so the error is surfaced instead.
 func (c *client) streamWithReconnect(ctx context.Context, resp *http.Response, newReq func(context.Context) (*http.Request, error), out chan<- provider.Chunk) {
 	defer close(out)
+	// An explicit WithMaxRetries budget (vision descriptions) also disables the
+	// mid-stream replay: one DescribeOnce call maps to exactly one HTTP request,
+	// and the outer image router owns retries instead. A negative override
+	// restores the package default (maxStreamReconnects).
+	reconnectLimit := maxStreamReconnects
+	if max, ok := provider.MaxRetriesFromContext(ctx); ok && max >= 0 {
+		reconnectLimit = max
+	}
 	for attempt := 0; ; attempt++ {
 		emitted, err := c.readStream(ctx, resp, out)
 		if err == nil {
@@ -669,7 +677,9 @@ func (c *client) streamWithReconnect(ctx context.Context, resp *http.Response, n
 			sendChunk(ctx, out, provider.Chunk{Type: provider.ChunkError, Err: &provider.StreamInterruptedError{Err: err}})
 			return
 		}
-		if attempt >= maxStreamReconnects {
+		// reconnectLimit is always the default (3) or a non-negative override,
+		// so the >= 0 guard is unnecessary.
+		if attempt >= reconnectLimit {
 			sendChunk(ctx, out, provider.Chunk{Type: provider.ChunkError, Err: err})
 			return
 		}

@@ -548,21 +548,64 @@ func (c *Controller) HasRefs(line string) bool {
 	return len(c.detectRefs(line)) > 0
 }
 
-// inputImages resolves image @-references in the turn input to data URLs so the
-// turn can carry them to a vision-capable model. Best-effort: an unreadable image
-// is skipped — the @ref still lands as text via ResolveRefs.
-func (c *Controller) inputImages(line string) []string {
-	if !c.imageInputEnabled() {
-		return nil
-	}
-	var urls []string
+// ResolvedImage is an image @-reference resolved to a data URL, keeping the
+// original reference text and the on-disk path so the image router can decide
+// how to carry it (direct, describe-then-text, or path-only) without re-reading.
+type ResolvedImage struct {
+	Ref     string
+	Path    string
+	DataURL string
+	Error   string
+}
+
+// resolveInputImages resolves image @-references in the turn input to data
+// URLs. It never consults model capabilities — that is the image router's job —
+// so the vision model can still see attachments when the main model cannot.
+// Unreadable image candidates are retained with Error set, so the router can
+// degrade the whole image turn to path-only instead of silently dropping one.
+func (c *Controller) resolveInputImages(line string) []ResolvedImage {
+	var images []ResolvedImage
 	for _, r := range c.detectRefs(line) {
 		baseDir := c.workspaceRoot
 		if r.baseDir != "" {
 			baseDir = r.baseDir
 		}
-		if url, err := visionRefImageDataURL(r, baseDir); err == nil {
-			urls = append(urls, url)
+		url, err := visionRefImageDataURL(r, baseDir)
+		if err != nil {
+			if isImageRefCandidate(r) {
+				images = append(images, ResolvedImage{
+					Ref:   r.raw,
+					Path:  r.path,
+					Error: "图片文件无法读取或格式不受支持",
+				})
+			}
+			continue
+		}
+		images = append(images, ResolvedImage{
+			Ref:     r.raw,
+			Path:    r.path,
+			DataURL: url,
+		})
+	}
+	return images
+}
+
+func isImageRefCandidate(r ref) bool {
+	return r.kind == refImage || (r.kind == refFile && isImageAttachmentRef(r.path))
+}
+
+// inputImages resolves image @-references to data URLs only when the main model
+// supports vision. It remains the entry point for callers that do not route
+// images (legacy paths); the routed paths use resolveInputImages + routeImagesOnce.
+func (c *Controller) inputImages(line string) []string {
+	if !c.imageInputEnabled() {
+		return nil
+	}
+	images := c.resolveInputImages(line)
+	urls := make([]string, 0, len(images))
+	for _, img := range images {
+		if img.DataURL != "" {
+			urls = append(urls, img.DataURL)
 		}
 	}
 	return urls
@@ -571,6 +614,15 @@ func (c *Controller) inputImages(line string) []string {
 func visionRefImageDataURL(r ref, baseDir string) (string, error) {
 	switch r.kind {
 	case refImage:
+		// Desktop attachments are stored under the active workspace, while the
+		// process working directory is restored before turn execution. Reuse the
+		// existing workspace-scoped multimodal reader so attachment lookup stays
+		// rooted at Controller.workspaceRoot instead of the process cwd.
+		if strings.TrimSpace(baseDir) != "" {
+			return visionFileImageDataURL(r.path, baseDir)
+		}
+		// Preserve the legacy single-workspace CLI path when no controller root
+		// exists; that mode intentionally resolves attachments from cwd.
 		return visionImageDataURL(r.path)
 	case refFile:
 		return visionFileImageDataURL(r.path, baseDir)
@@ -867,7 +919,7 @@ func (c *Controller) resolveRefs(ctx context.Context, line string, scopedOnly bo
 			if r.baseDir != "" {
 				baseDir = r.baseDir
 			}
-			text, isDir, err := readFileRef(r.path, baseDir)
+			text, isDir, err := readFileRef(r.path, baseDir, c.imageRefNote)
 			if err != nil {
 				errs = append(errs, "@"+r.raw+" — "+err.Error())
 				continue
@@ -889,7 +941,7 @@ func (c *Controller) resolveRefs(ctx context.Context, line string, scopedOnly bo
 			}
 			appendRefBlock(&b, tag, `path="`+displayPath+`"`, text)
 		case refImage:
-			appendRefBlock(&b, "image", `path="`+r.path+`"`, "[image attachment available at @"+r.path+"; sent as direct model image input only when the selected model supports vision. Text-only models can still use an available OCR/image/vision tool with this local path; image bytes are not inlined into prompt text.]")
+			appendRefBlock(&b, "image", `path="`+r.path+`"`, c.imageRefNote(r.path, "", 0, true))
 		}
 	}
 	return b.String(), errs
@@ -965,13 +1017,13 @@ func directoryRefNote() string {
 // When baseDir is non-empty the read is sandboxed under it via os.Root so
 // user-supplied paths cannot escape the workspace; otherwise the path is
 // used as-is (CLI single-workspace compatibility).
-func readFileRef(path, baseDir string) (content string, isDir bool, err error) {
+func readFileRef(path, baseDir string, notes ...imageRefNoteFunc) (content string, isDir bool, err error) {
 	absPath, absBase, ok := resolveAbsRef(path, baseDir)
 	if !ok {
 		return "", false, os.ErrNotExist
 	}
 	if absBase == "" {
-		return readFileRefUnscoped(absPath)
+		return readFileRefUnscoped(absPath, notes...)
 	}
 
 	root, rerr := os.OpenRoot(absBase)
@@ -1023,7 +1075,7 @@ func readFileRef(path, baseDir string) (content string, isDir bool, err error) {
 	data := buf[:n]
 
 	if mime := imageMime(data, rel); mime != "" {
-		return imageFileRefNote(displayPath, mime, info.Size(), true), false, nil
+		return imageFileRefNoteFor(notes, displayPath, mime, info.Size(), true), false, nil
 	}
 	if bytes.IndexByte(data[:min(n, 8192)], 0) >= 0 {
 		return fmt.Sprintf("[binary file %s, %d bytes — not shown]", displayPath, info.Size()), false, nil
@@ -1036,7 +1088,7 @@ func readFileRef(path, baseDir string) (content string, isDir bool, err error) {
 
 // readFileRefUnscoped is the legacy readFileRef body kept for CLI single-workspace
 // compatibility, where no controller-scoped sandbox is in effect.
-func readFileRefUnscoped(path string) (content string, isDir bool, err error) {
+func readFileRefUnscoped(path string, notes ...imageRefNoteFunc) (content string, isDir bool, err error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", false, err
@@ -1102,7 +1154,7 @@ func readFileRefUnscoped(path string) (content string, isDir bool, err error) {
 	data := buf[:n]
 
 	if mime := imageMime(data, path); mime != "" {
-		return imageFileRefNote(path, mime, info.Size(), false), false, nil
+		return imageFileRefNoteFor(notes, path, mime, info.Size(), false), false, nil
 	}
 	if bytes.IndexByte(data[:min(n, 8192)], 0) >= 0 {
 		return fmt.Sprintf("[binary file %s, %d bytes — not shown]", path, info.Size()), false, nil
@@ -1113,11 +1165,45 @@ func readFileRefUnscoped(path string) (content string, isDir bool, err error) {
 	return string(data), false, nil
 }
 
+// imageRefNoteFunc renders an image-attachment note. It lets a caller with
+// controller state (the image router) override the default text-only note.
+type imageRefNoteFunc func(displayPath, mime string, size int64, attached bool) string
+
+func imageFileRefNoteFor(notes []imageRefNoteFunc, displayPath, mime string, size int64, attached bool) string {
+	if len(notes) > 0 && notes[0] != nil {
+		return notes[0](displayPath, mime, size, attached)
+	}
+	return imageFileRefNote(displayPath, mime, size, attached)
+}
+
 func imageFileRefNote(displayPath, mime string, size int64, attached bool) string {
 	if attached {
 		return fmt.Sprintf("[image file %s, mime=%s, %d bytes — sent as direct model image input only when the selected model supports vision. Text-only models can still use an available OCR/image/vision tool with this local path; image bytes are not inlined into prompt text.]", displayPath, mime, size)
 	}
 	return fmt.Sprintf("[image file %s, mime=%s, %d bytes — not sent as direct model image input because no workspace root is available. Use a workspace-scoped file reference, image attachment, or an available OCR/image/vision tool with a readable local path.]", displayPath, mime, size)
+}
+
+// imageRefNote renders the image-attachment note for the current route state:
+// direct to a vision-capable main model, described by the configured vision
+// model, or the default text-only path when neither applies.
+func (c *Controller) imageRefNote(displayPath, mime string, size int64, attached bool) string {
+	switch {
+	case c.mainModelSupportsVision():
+		if mime == "" {
+			return "[image attachment available at @" + displayPath + "; sent as direct model image input to the vision-capable main model.]"
+		}
+		return fmt.Sprintf("[image file %s, mime=%s, %d bytes — sent as direct model image input to the vision-capable main model.]", displayPath, mime, size)
+	case c.resolveVisionModelStatus().Kind == VisionModelSupported:
+		if mime == "" {
+			return "[image attachment available at @" + displayPath + "; the main model cannot read images, so the configured vision model will describe it — if that fails, the attachment stays as a path.]"
+		}
+		return fmt.Sprintf("[image file %s, mime=%s, %d bytes — the main model cannot read images, so the configured vision model will describe it; if that fails, the file stays as a path.]", displayPath, mime, size)
+	default:
+		if mime == "" {
+			return "[image attachment available at @" + displayPath + "; sent as direct model image input only when the selected model supports vision. Text-only models can still use an available OCR/image/vision tool with this local path; image bytes are not inlined into prompt text.]"
+		}
+		return imageFileRefNote(displayPath, mime, size, attached)
+	}
 }
 
 // walkRootDir walks a directory under a sandboxed *os.Root and writes each
@@ -1202,7 +1288,9 @@ func resolveAbsRef(path, baseDir string) (absPath, absBase string, ok bool) {
 func readPDFRef(path string, size int64) string {
 	result, err := extractPDFText(path)
 	if err != nil {
-		return fmt.Sprintf("[PDF file %s, %d bytes — text extraction unavailable: %v. If this is a scanned/image-only PDF, use OCR or an available multimodal/vision tool with this path.]", path, size, err)
+		// Fixed copy: the extractor's stderr may embed absolute paths or internal
+		// diagnostics that must not reach the main model or the session history.
+		return fmt.Sprintf("[PDF file %s, %d bytes — text extraction unavailable. If this is a scanned/image-only PDF, use OCR or an available multimodal/vision tool with this path.]", path, size)
 	}
 	text := strings.TrimSpace(result.text)
 	if text == "" {

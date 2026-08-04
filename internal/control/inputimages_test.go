@@ -42,6 +42,26 @@ func TestControllerInputImagesResolvesAttachment(t *testing.T) {
 	}
 }
 
+func TestControllerInputImagesResolvesWorkspaceAttachmentOutsideProcessCWD(t *testing.T) {
+	workspace := t.TempDir()
+	writeVisionTestConfig(t, workspace)
+	ref, err := SaveImageBytesInRoot(workspace, "image/png", mustBase64(t, tinyPNG))
+	if err != nil {
+		t.Fatalf("SaveImageBytesInRoot: %v", err)
+	}
+	// Desktop image saving is scoped to the active workspace, but the process
+	// working directory is restored before the controller resolves the turn.
+	t.Chdir(t.TempDir())
+
+	urls := (&Controller{workspaceRoot: workspace, modelRef: "custom/vision-pro"}).inputImages("look at @" + ref)
+	if len(urls) != 1 {
+		t.Fatalf("inputImages outside workspace cwd = %v, want one resolved data URL", urls)
+	}
+	if !strings.HasPrefix(urls[0], "data:image/png;base64,") {
+		t.Errorf("resolved url = %q, want a png data URL", urls[0])
+	}
+}
+
 func TestControllerInputImagesIgnoresNonAttachmentRefs(t *testing.T) {
 	t.Chdir(t.TempDir())
 	if urls := New(Options{}).inputImages("plain text with @missing.png"); len(urls) != 0 {
@@ -136,5 +156,111 @@ func TestControllerImageInputEnabledDoesNotFallbackFromUnknownRef(t *testing.T) 
 	c := &Controller{workspaceRoot: workspace, modelRef: "deleted/model"}
 	if c.imageInputEnabled() {
 		t.Fatal("unknown ref should not inherit image input from the default fallback model")
+	}
+}
+
+func TestControllerResolveInputImagesIgnoresModelCapability(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeVisionTestConfig(t, dir)
+	ref, err := SaveImageDataURL("data:image/png;base64," + tinyPNG)
+	if err != nil {
+		t.Fatalf("SaveImageDataURL: %v", err)
+	}
+	// The same config: vision-pro is the vision model, text-only is not.
+	// inputImages gates on the main model; resolveInputImages must not.
+	textOnly := (&Controller{modelRef: "custom/text-only"})
+	if got := textOnly.inputImages("look at @" + ref); len(got) != 0 {
+		t.Fatalf("inputImages for text-only model = %v, want nil (gated)", got)
+	}
+	imgs := textOnly.resolveInputImages("look at @" + ref)
+	if len(imgs) != 1 {
+		t.Fatalf("resolveInputImages = %+v, want one resolved image regardless of model", imgs)
+	}
+	if !strings.HasPrefix(imgs[0].DataURL, "data:image/png;base64,") {
+		t.Errorf("DataURL = %q, want png data url", imgs[0].DataURL)
+	}
+	if imgs[0].Ref == "" || imgs[0].Path == "" {
+		t.Errorf("ResolvedImage keeps ref/path for notices: %+v", imgs[0])
+	}
+}
+
+func TestControllerResolveInputImagesPreservesOrder(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeVisionTestConfig(t, dir)
+	r1, err := SaveImageDataURL("data:image/png;base64," + tinyPNG)
+	if err != nil {
+		t.Fatalf("SaveImageDataURL: %v", err)
+	}
+	r2, err := SaveImageDataURL("data:image/png;base64," + tinyPNG)
+	if err != nil {
+		t.Fatalf("SaveImageDataURL: %v", err)
+	}
+	imgs := (&Controller{modelRef: "custom/vision-pro"}).resolveInputImages("first @" + r1 + " second @" + r2)
+	if len(imgs) != 2 {
+		t.Fatalf("resolveInputImages = %+v, want two images", imgs)
+	}
+	if imgs[0].Ref != r1 || imgs[1].Ref != r2 {
+		t.Errorf("order not preserved: %+v", imgs)
+	}
+}
+
+func TestControllerResolveInputImagesKeepsUnreadableImageCandidate(t *testing.T) {
+	workspace := t.TempDir()
+	badPath := filepath.Join(workspace, "bad.png")
+	if err := os.WriteFile(badPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := &Controller{workspaceRoot: workspace, modelRef: "custom/text-only"}
+	images := c.resolveInputImages("look at @bad.png")
+	if len(images) != 1 {
+		t.Fatalf("resolveInputImages = %+v, want one failed image candidate", images)
+	}
+	if images[0].DataURL != "" || images[0].Error == "" {
+		t.Fatalf("failed image = %+v, want empty DataURL and non-empty Error", images[0])
+	}
+	if got := c.resolveInputImages("read @main.go"); len(got) != 0 {
+		t.Fatalf("non-image ref = %+v, want ignored", got)
+	}
+}
+
+func TestImageRefNoteReflectsRouterState(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeVisionTestConfig(t, dir) // custom/vision-pro supports vision, custom/text-only does not
+
+	vision := (&Controller{modelRef: "custom/vision-pro"})
+	textOnly := (&Controller{modelRef: "custom/text-only"})
+	textOnlyWithFallback := (&Controller{modelRef: "custom/text-only", visionModelRef: "custom/vision-pro"})
+
+	// Vision-capable main model: note says direct image input.
+	if got := vision.imageRefNote("shot.png", "image/png", 42, true); !strings.Contains(got, "vision-capable main model") {
+		t.Errorf("vision-capable note = %q, want direct-input wording", got)
+	}
+
+	// Text-only main model + configured vision fallback: note points at the router.
+	if got := textOnlyWithFallback.imageRefNote("shot.png", "image/png", 42, true); !strings.Contains(got, "configured vision model will describe") {
+		t.Errorf("fallback note = %q, want vision-model wording", got)
+	}
+
+	// Text-only main model + vision_model that itself cannot read images:
+	// the note must NOT promise a description (the router will go path-only).
+	badFallback := (&Controller{modelRef: "custom/text-only", visionModelRef: "custom/text-only"})
+	if got := badFallback.imageRefNote("shot.png", "image/png", 42, true); strings.Contains(got, "configured vision model will describe") {
+		t.Errorf("unsupported vision_model note = %q, must not promise a description", got)
+	}
+
+	// Text-only without fallback: keep the default OCR/tool guidance.
+	if got := textOnly.imageRefNote("shot.png", "image/png", 42, true); !strings.Contains(got, "OCR/image/vision tool") {
+		t.Errorf("text-only note = %q, want default OCR wording", got)
+	}
+
+	// Attachment form (empty mime) also reflects the fallback.
+	if got := textOnlyWithFallback.imageRefNote("shot.png", "", 0, true); !strings.Contains(got, "configured vision model will describe") {
+		t.Errorf("attachment fallback note = %q, want vision-model wording", got)
 	}
 }

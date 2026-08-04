@@ -256,6 +256,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	} else {
 		b.WriteString("# subagent_model = \"deepseek-pro\"   # optional default for runAs=subagent skills\n")
 	}
+	if c.Agent.VisionModel != "" {
+		fmt.Fprintf(&b, "vision_model = %q   # turns attached images into text when the main model lacks vision\n", c.Agent.VisionModel)
+	} else {
+		b.WriteString("# vision_model = \"provider/vision-model\"   # optional: describe images when the main model has no vision\n")
+	}
 	if len(c.Agent.SubagentModels) > 0 {
 		fmt.Fprintf(&b, "subagent_models = %s   # per-skill overrides\n", renderStringMap(c.Agent.SubagentModels))
 	} else {
@@ -956,6 +961,10 @@ func RenderTOMLProjectDelta(c *Config) string {
 	}
 	if c.Agent.SubagentModel != "" && c.Agent.SubagentModel != d.Agent.SubagentModel {
 		fmt.Fprintf(&agentBuf, "subagent_model = %q\n", c.Agent.SubagentModel)
+		anyAgent = true
+	}
+	if c.Agent.VisionModel != "" && c.Agent.VisionModel != d.Agent.VisionModel {
+		fmt.Fprintf(&agentBuf, "vision_model = %q\n", c.Agent.VisionModel)
 		anyAgent = true
 	}
 	if len(c.Agent.SubagentModels) > 0 && !reflect.DeepEqual(c.Agent.SubagentModels, d.Agent.SubagentModels) {

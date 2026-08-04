@@ -415,7 +415,7 @@ func TestChildMaxStepsSharedDefault(t *testing.T) {
 
 func TestTaskToolPropagatesDeliveryProfileToSubagents(t *testing.T) {
 	task := (&TaskTool{}).WithDeliveryProfile(true)
-	opts := task.subagentOptions(context.Background(), 0, nil, 0, 1, "", nil)
+	opts := task.subagentOptions(context.Background(), 0, nil, 0, 1, "", nil, "")
 	if !opts.DeliveryProfile {
 		t.Fatal("sub-agent options did not inherit delivery profile")
 	}
@@ -427,9 +427,41 @@ func TestTaskToolSharesWorkspaceLeaseWithSubagents(t *testing.T) {
 		t.Fatalf("New workspace lease: %v", err)
 	}
 	task := (&TaskTool{}).WithWorkspaceLease(owner)
-	opts := task.subagentOptions(context.Background(), 0, nil, 0, 1, "", nil)
+	opts := task.subagentOptions(context.Background(), 0, nil, 0, 1, "", nil, "")
 	if opts.WorkspaceLease != owner {
 		t.Fatal("sub-agent options did not share the parent's workspace lease owner")
+	}
+}
+
+// TestTaskToolPropagatesToolImagesAndModelCapability proves every sub-agent
+// inherits the shared tool-image processor and resolves its own image-input
+// capability from its model ref ("" = parent model).
+func TestTaskToolPropagatesToolImagesAndModelCapability(t *testing.T) {
+	fp := &fakeToolImageProcessor{}
+	task := &TaskTool{
+		toolImages: fp,
+		modelSupportsImages: func(modelRef string) bool {
+			return modelRef == "qwen/qwen3.7-plus"
+		},
+	}
+	visionOpts := task.subagentOptions(context.Background(), 0, nil, 0, 1, "", nil, "qwen/qwen3.7-plus")
+	if visionOpts.ToolImages != fp {
+		t.Fatal("sub-agent options did not inherit the shared tool-image processor")
+	}
+	if !visionOpts.ModelSupportsImages {
+		t.Fatal("multimodal sub-agent model must be flagged vision-capable")
+	}
+	textOpts := task.subagentOptions(context.Background(), 0, nil, 0, 1, "", nil, "deepseek/deepseek-v3")
+	if textOpts.ModelSupportsImages {
+		t.Fatal("text sub-agent model must not be flagged vision-capable")
+	}
+	parentOpts := task.subagentOptions(context.Background(), 0, nil, 0, 1, "", nil, "")
+	if parentOpts.ModelSupportsImages {
+		t.Fatal("parent-model ref resolved vision-capable when the resolver says text-only")
+	}
+	nilOpts := (&TaskTool{}).subagentOptions(context.Background(), 0, nil, 0, 1, "", nil, "")
+	if nilOpts.ToolImages != nil || nilOpts.ModelSupportsImages {
+		t.Fatalf("unconfigured TaskTool leaked image wiring: %+v", nilOpts)
 	}
 }
 

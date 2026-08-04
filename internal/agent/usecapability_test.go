@@ -353,7 +353,7 @@ func TestPlannerFirstOnDemandMCPCallPreservesImages(t *testing.T) {
 		{{Type: provider.ChunkText, Text: "done"}, {Type: provider.ChunkDone}},
 	}}
 	session := NewSession("sys")
-	planner := NewPlannerAgent(prov, reg, session, Options{}, event.Discard)
+	planner := NewPlannerAgent(prov, reg, session, Options{ModelSupportsImages: true}, event.Discard)
 	if host.HasClient("image") {
 		t.Fatal("test requires the MCP server to start on first tool dispatch")
 	}

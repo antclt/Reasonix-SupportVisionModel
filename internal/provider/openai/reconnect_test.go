@@ -295,3 +295,86 @@ func TestStreamDoesNotReplayAfterOutput(t *testing.T) {
 		t.Errorf("server saw %d requests, want 1 (no replay after output)", reqs)
 	}
 }
+
+// TestStreamMaxRetriesZeroDisablesReconnect proves the vision retry contract at
+// the provider layer: WithMaxRetries(ctx, 0) turns an early conn reset into a
+// surfaced error after exactly one HTTP request — the outer image router owns
+// retries, never the reconnect loop.
+func TestStreamMaxRetriesZeroDisablesReconnect(t *testing.T) {
+	var reqs int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs++
+		rstAfter(t, w, ": keep-alive\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{Name: "deepseek", BaseURL: srv.URL, Model: "deepseek-v4", APIKey: "k"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := provider.WithMaxRetries(context.Background(), 0)
+	ch, err := p.Stream(ctx, provider.Request{Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}}})
+	if err != nil {
+		// On Windows the RST may arrive before Stream returns; on other runs it
+		// arrives while the response channel is being consumed. Both are valid
+		// surfaced failures, and the contract under test is still one request.
+		if reqs != 1 {
+			t.Fatalf("Stream error after %d requests, want exactly 1: %v", reqs, err)
+		}
+		return
+	}
+	sawError := false
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Fatal("early conn reset with zero retry budget must surface an error")
+	}
+	if reqs != 1 {
+		t.Errorf("server saw %d requests, want exactly 1 (no reconnect)", reqs)
+	}
+}
+
+// TestStreamMaxRetriesNegativeRestoresDefaultReconnect proves a negative
+// override keeps the package default: the early reset is still replayed.
+func TestStreamMaxRetriesNegativeRestoresDefaultReconnect(t *testing.T) {
+	var reqs int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs++
+		if reqs == 1 {
+			rstAfter(t, w, ": keep-alive\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{Name: "deepseek", BaseURL: srv.URL, Model: "deepseek-v4", APIKey: "k"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := provider.WithMaxRetries(context.Background(), -1)
+	ch, err := p.Stream(ctx, provider.Request{Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	var text strings.Builder
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("default budget should still replay: %v", chunk.Err)
+		}
+		if chunk.Type == provider.ChunkText {
+			text.WriteString(chunk.Text)
+		}
+	}
+	if text.String() != "ok" {
+		t.Fatalf("text = %q, want %q", text.String(), "ok")
+	}
+	if reqs != 2 {
+		t.Errorf("server saw %d requests, want 2 (default reconnect restored)", reqs)
+	}
+}

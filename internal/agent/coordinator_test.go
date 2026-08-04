@@ -2046,3 +2046,65 @@ func TestCoordinatorDoesNotAskForTargetConfirmationWording(t *testing.T) {
 		t.Fatal("executor should run for ordinary plan wording")
 	}
 }
+
+func TestCoordinatorDirectImageTurnBypassesPlanner(t *testing.T) {
+	planner := &mockProvider{name: "planner", streams: [][]provider.Chunk{
+		{{Type: provider.ChunkText, Text: "plan."}, {Type: provider.ChunkDone}},
+	}}
+	exec := &mockProvider{name: "executor", streams: [][]provider.Chunk{
+		{{Type: provider.ChunkText, Text: "done."}, {Type: provider.ChunkDone}},
+	}}
+	policy := func(_ context.Context, _ string) PlannerDecision {
+		return PlannerDecision{Route: PlannerRoutePlanAndExecute, Depth: PlannerDepthFull, Reason: "always"}
+	}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	coord := NewCoordinatorWithPlannerPolicy(planner, NewSession("planner-sys"), nil, nil, Options{}, executor, 0, event.Discard, policy)
+
+	ctx := WithDirectImageTurn(context.Background(), true)
+	if err := coord.Run(ctx, "look at this"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if planner.lastReq.Messages != nil {
+		t.Fatal("planner must be bypassed on a direct-image turn")
+	}
+	if got := lastUser(exec.lastReq); got != "look at this" {
+		t.Errorf("executor saw %q, want the raw input", got)
+	}
+}
+
+func TestCoordinatorDirectImageTurnUsesExecutorProviderForExplicitPlanOnly(t *testing.T) {
+	planner := &mockProvider{name: "planner", streams: [][]provider.Chunk{
+		{{Type: provider.ChunkText, Text: "plan."}, {Type: provider.ChunkDone}},
+	}}
+	exec := &mockProvider{name: "executor", streams: [][]provider.Chunk{
+		{{Type: provider.ChunkText, Text: "done."}, {Type: provider.ChunkDone}},
+	}}
+	// Explicit user choice: plan only. A direct-image turn must NOT override it.
+	policy := func(_ context.Context, _ string) PlannerDecision {
+		return PlannerDecision{Route: PlannerRoutePlanOnly, Depth: PlannerDepthFull, Reason: "explicit_plan_only"}
+	}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	coord := NewCoordinatorWithPlannerPolicy(planner, NewSession("planner-sys"), nil, nil, Options{}, executor, 0, event.Discard, policy)
+
+	ctx := WithUserImages(context.Background(), []string{"data:image/png;base64,AAAA"})
+	ctx = WithDirectImageTurn(ctx, true)
+	if err := coord.Run(ctx, "look at this"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if planner.lastReq.Messages != nil {
+		t.Fatal("dedicated planner must be bypassed on a direct-image turn")
+	}
+	if len(exec.lastReq.Messages) == 0 {
+		t.Fatal("executor provider must produce the image-aware plan")
+	}
+	last := exec.lastReq.Messages[len(exec.lastReq.Messages)-1]
+	if last.Role != provider.RoleUser || len(last.Images) != 1 {
+		t.Fatalf("image-aware plan request = %+v, want one raw image on the user message", last)
+	}
+	if len(exec.lastReq.Tools) != 0 {
+		t.Fatalf("image-aware plan exposed tools: %v", exec.lastReq.Tools)
+	}
+	if len(exec.requests) != 1 {
+		t.Fatalf("executor provider calls = %d, want plan only with no execution", len(exec.requests))
+	}
+}

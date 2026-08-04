@@ -21,6 +21,7 @@ import (
 	"reasonix/internal/planmode"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
+	"reasonix/internal/vision"
 	"reasonix/internal/workspacelease"
 )
 
@@ -275,6 +276,13 @@ type TaskTool struct {
 	// sub-agent gets its own use_capability frontend so ledger state stays
 	// isolated while connections reuse the parent Host.
 	capabilityRuntime *MCPCapabilityRuntime
+	// toolImages is the shared tool-image processor every sub-agent inherits,
+	// so a child that reads a screenshot through read_file routes it through
+	// the same vision model as the parent. modelSupportsImages reports whether
+	// a given sub-agent model ref accepts image input directly ("" = parent
+	// model); nil disables both.
+	toolImages          vision.ToolImageProcessor
+	modelSupportsImages func(modelRef string) bool
 }
 
 // TaskToolOptions holds the construction parameters for a TaskTool.
@@ -299,6 +307,11 @@ type TaskToolOptions struct {
 	SubagentModel       string
 	SubagentEffort      string
 	ResolveProvider     func(string, string) (provider.Provider, *provider.Pricing, int, error)
+	// ToolImages is shared with every sub-agent (see Options.ToolImages).
+	ToolImages vision.ToolImageProcessor
+	// ModelSupportsImages reports whether a sub-agent model ref accepts image
+	// input directly; "" resolves to the parent model's capability.
+	ModelSupportsImages func(modelRef string) bool
 }
 
 // NewTaskToolWithOptions is the internal standard constructor for TaskTool.
@@ -329,6 +342,8 @@ func NewTaskToolWithOptions(opts TaskToolOptions) *TaskTool {
 		subagentModel:       opts.SubagentModel,
 		subagentEffort:      opts.SubagentEffort,
 		resolveProvider:     opts.ResolveProvider,
+		toolImages:          opts.ToolImages,
+		modelSupportsImages: opts.ModelSupportsImages,
 		maxSubagentDepth:    DefaultMaxSubagentDepth,
 	}
 }
@@ -1632,7 +1647,8 @@ func (t *TaskTool) resolveSubSessionRuntime(modelRef, effort string) (provider.P
 }
 
 func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID, modelRef string, mutationObserver *checkpoint.MutationObserver) (string, error) {
-	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver)
+	ctx = WithoutUserImages(ctx)
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver, modelRef)
 	opts.ModelRef = modelRef
 	// Capture the pristine task before host framing is prepended: delivery
 	// intent classification must judge the task, not the wrapper.
@@ -1642,7 +1658,8 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 }
 
 func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID, modelRef string, mutationObserver *checkpoint.MutationObserver) (string, error) {
-	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver)
+	ctx = WithoutUserImages(ctx)
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver, modelRef)
 	opts.ModelRef = modelRef
 	// Capture the pristine task before host framing is prepended: delivery
 	// intent classification must judge the task, not the wrapper.
@@ -1653,9 +1670,11 @@ func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, sub
 
 // subagentOptions is the single construction point for the run options every
 // sub-agent spawned through this tool shares (task, read_only_task, and
-// parallel_tasks children). Compaction, language preferences, and depth limits
-// must stay uniform across those paths — add new fields here, not at call sites.
-func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *provider.Pricing, ctxWin, childDepth int, recoveryTaskID string, mutationObserver *checkpoint.MutationObserver) Options {
+// parallel_tasks children). Compaction, language preferences, depth limits,
+// and the tool-image pipeline must stay uniform across those paths — add new
+// fields here, not at call sites. modelRef is the resolved sub-agent model
+// ("" = parent model) and drives the local ModelSupportsImages verdict.
+func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *provider.Pricing, ctxWin, childDepth int, recoveryTaskID string, mutationObserver *checkpoint.MutationObserver, modelRef string) Options {
 	opts := Options{
 		MaxSteps:            maxSteps,
 		Temperature:         t.temperature,
@@ -1680,8 +1699,21 @@ func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *p
 		RecoveryAgentID:     "subagent",
 		RecoveryTaskID:      recoveryTaskID,
 		MutationObserver:    mutationObserver,
+		ToolImages:          t.toolImages,
+		ModelSupportsImages: t.subagentSupportsImages(modelRef),
 	}
 	return opts
+}
+
+// subagentSupportsImages resolves the local image-capability verdict for a
+// sub-agent model ref ("" = the parent provider's model). Without a resolver
+// the verdict is false, which routes tool images to the vision fallback — the
+// safe default for text models.
+func (t *TaskTool) subagentSupportsImages(modelRef string) bool {
+	if t.modelSupportsImages == nil {
+		return false
+	}
+	return t.modelSupportsImages(modelRef)
 }
 
 func subagentRecoveryTaskID(ctx context.Context, ref string) string {

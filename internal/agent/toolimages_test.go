@@ -33,6 +33,8 @@ func (f *fakeImageTool) ExecuteWithImages(ctx context.Context, args json.RawMess
 // Tool-result images must reach the session message intact even when the text
 // output blows the truncation budget: the head+tail splice that trims tool text
 // would corrupt a base64 payload, so images ride outside the truncated text.
+// The agent is configured as a vision-capable model so the originals survive
+// routing untouched.
 func TestToolResultImagesBypassTruncation(t *testing.T) {
 	dataURL := "data:image/png;base64," + strings.Repeat("QUFB", 20000) // ~80KB payload, alone over the text budget
 	longText := strings.Repeat("x", maxToolOutputBytes+1024) + "[image: image/png]"
@@ -42,7 +44,7 @@ func TestToolResultImagesBypassTruncation(t *testing.T) {
 		{toolCallChunk("c1", "shot", `{}`), {Type: provider.ChunkDone}},
 		{{Type: provider.ChunkText, Text: "done"}, {Type: provider.ChunkDone}},
 	}}
-	a := New(prov, reg, NewSession(""), Options{}, event.Discard)
+	a := New(prov, reg, NewSession(""), Options{ModelSupportsImages: true}, event.Discard)
 	if err := a.Run(context.Background(), "take a screenshot"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}

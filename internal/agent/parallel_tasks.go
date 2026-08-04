@@ -215,13 +215,14 @@ func (p *ParallelTasksTool) Execute(ctx context.Context, args json.RawMessage) (
 			if p.taskTool.mutationObserver != nil {
 				mutationObserver = p.taskTool.mutationObserver.CloneForSubagent(recoveryTaskID, p.taskTool.mutationObserver.OwnershipTurn(), false)
 			}
-			opts := p.taskTool.subagentOptions(ctx, max, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver)
+			opts := p.taskTool.subagentOptions(ctx, max, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver, modelRef)
 			opts.ModelRef = usageModelRef
 			// Same contract as runSubSession: capture the pristine task before
 			// host framing is prepended so delivery intent classification judges
 			// the task, not the wrapper.
 			opts.ClassifierTaskText = t.Prompt
-			output, runErr := RunReadOnlySubAgentWithSession(ctx, prov, subReg, sess, p.taskTool.withWorkspaceContext(t.Prompt),
+			childCtx := WithoutUserImages(ctx)
+			output, runErr := RunReadOnlySubAgentWithSession(childCtx, prov, subReg, sess, p.taskTool.withWorkspaceContext(t.Prompt),
 				opts, nested)
 
 			if ctx.Err() != nil && runErr == nil {

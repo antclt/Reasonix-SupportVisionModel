@@ -1243,9 +1243,16 @@ type AgentConfig struct {
 	RecoveryTemperature float64           `toml:"recovery_temperature"`
 	SubagentModel       string            `toml:"subagent_model"`
 	SubagentModels      map[string]string `toml:"subagent_models"`
-	SubagentEffort      string            `toml:"subagent_effort"`
-	SubagentEfforts     map[string]string `toml:"subagent_efforts"`
-	MaxSubagentDepth    int               `toml:"max_subagent_depth"`
+	// VisionModel optionally names an already-configured model that turns
+	// user-attached images into plain-text descriptions when the main model
+	// does not support image input. It gets at most three tool-less provider
+	// requests per user turn and never enters the main
+	// session history. Empty disables the fallback: images are kept as paths
+	// and the main model is told it cannot read them.
+	VisionModel      string            `toml:"vision_model"`
+	SubagentEffort   string            `toml:"subagent_effort"`
+	SubagentEfforts  map[string]string `toml:"subagent_efforts"`
+	MaxSubagentDepth int               `toml:"max_subagent_depth"`
 	// MaxSubagentConcurrency bounds how many sub-agents (task, fleet items,
 	// profile skills, nested children) may run at once in one session.
 	// 0 means the default (6). Values outside 1–32 are clamped on load.

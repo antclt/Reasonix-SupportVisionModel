@@ -1529,3 +1529,47 @@ func TestRenderTOMLPersistsSecretsSection(t *testing.T) {
 		t.Fatalf("user-scope render still exposes removed live-redaction setting:\n%s", out)
 	}
 }
+
+func TestRenderTOMLRoundTripsAgentVisionModel(t *testing.T) {
+	orig := Default()
+	orig.Agent.VisionModel = "qwen/qwen2.5-vl-72b-instruct"
+
+	rendered := RenderTOML(orig)
+	if !strings.Contains(rendered, `vision_model = "qwen/qwen2.5-vl-72b-instruct"`) {
+		t.Fatalf("rendered TOML missing agent vision_model:\n%s", rendered)
+	}
+
+	var got Config
+	if _, err := toml.Decode(rendered, &got); err != nil {
+		t.Fatalf("rendered TOML does not parse: %v", err)
+	}
+	if got.Agent.VisionModel != orig.Agent.VisionModel {
+		t.Fatalf("vision_model after round trip = %q, want %q", got.Agent.VisionModel, orig.Agent.VisionModel)
+	}
+
+	// Unset: render only a comment, never an assignment.
+	empty := RenderTOML(Default())
+	if strings.Contains(empty, "\nvision_model =") {
+		t.Fatalf("empty config rendered a vision_model assignment:\n%s", empty)
+	}
+}
+
+func TestProjectDeltaRendersAgentVisionModel(t *testing.T) {
+	c := Default()
+	c.Agent.VisionModel = "qwen/qwen2.5-vl-72b-instruct"
+
+	delta := RenderTOMLProjectDelta(c)
+	for _, want := range []string{"[agent]", `vision_model = "qwen/qwen2.5-vl-72b-instruct"`} {
+		if !strings.Contains(delta, want) {
+			t.Fatalf("project delta missing %q:\n%s", want, delta)
+		}
+	}
+
+	got := Default()
+	if _, err := toml.Decode(delta, got); err != nil {
+		t.Fatalf("project delta does not parse: %v", err)
+	}
+	if got.Agent.VisionModel != c.Agent.VisionModel {
+		t.Fatalf("vision_model after delta round trip = %q, want %q", got.Agent.VisionModel, c.Agent.VisionModel)
+	}
+}

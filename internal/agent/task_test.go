@@ -55,6 +55,35 @@ func TestTaskToolReturnsSubAgentFinalAnswer(t *testing.T) {
 	}
 }
 
+func TestTaskToolDoesNotInheritParentImages(t *testing.T) {
+	sub := &mockProvider{name: "sub", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "done"},
+		{Type: provider.ChunkDone},
+	}}
+	task := newTestTaskTool(t, sub, tool.NewRegistry(), "test-sys-prompt", "", "", nil)
+	ctx := WithUserImages(testTaskContext(), []string{"data:image/png;base64,parent"})
+	ctx = WithDirectImageTurn(ctx, true)
+	clean := WithoutUserImages(ctx)
+	if len(userImages(clean)) != 0 || DirectImageTurn(clean) {
+		t.Fatalf("clean child context kept image state: images=%v direct=%v", userImages(clean), DirectImageTurn(clean))
+	}
+
+	if _, err := task.Execute(ctx, []byte(`{"prompt":"inspect without parent image"}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for i := len(sub.lastReq.Messages) - 1; i >= 0; i-- {
+		message := sub.lastReq.Messages[i]
+		if message.Role != provider.RoleUser {
+			continue
+		}
+		if len(message.Images) != 0 {
+			t.Fatalf("sub-agent inherited parent images: %v", message.Images)
+		}
+		return
+	}
+	t.Fatal("sub-agent request has no user message")
+}
+
 func TestSubagentResultWarnsOnHostDecisionLanguage(t *testing.T) {
 	out := GuardSubagentHostDecisionText("等待用户批准后再执行修改")
 	if !strings.Contains(out, "Subagent boundary") {

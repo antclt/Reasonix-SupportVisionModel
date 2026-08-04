@@ -28,6 +28,7 @@ import (
 	"reasonix/internal/sandbox"
 	"reasonix/internal/shellparse"
 	"reasonix/internal/tool"
+	"reasonix/internal/vision"
 	"reasonix/internal/workspacelease"
 )
 
@@ -35,7 +36,7 @@ import (
 // context. ~32KB is roughly 8K tokens — enough for a full file read or a busy
 // grep, while preventing one accidental "read this 5 MB log" from blowing the
 // window before the next compaction runs.
-const maxToolOutputBytes = 32 * 1024
+const maxToolOutputBytes = vision.DefaultToolResultTextBytes
 
 const maxFinalReadinessBlocks = 3
 
@@ -91,6 +92,7 @@ type callContextKey struct{}
 type parentSessionContextKey struct{}
 type subagentDepthContextKey struct{}
 type userImagesContextKey struct{}
+type directImageTurnContextKey struct{}
 
 // callContext is the per-call context a tool can read. parentID is the call being
 // executed and sink is the agent's event sink (the `task` tool uses both to nest
@@ -179,9 +181,29 @@ func WithUserImages(ctx context.Context, images []string) context.Context {
 	return context.WithValue(ctx, userImagesContextKey{}, images)
 }
 
+// WithoutUserImages creates a child-agent context that cannot inherit raw
+// images or the parent turn's direct-image routing marker.
+func WithoutUserImages(ctx context.Context) context.Context {
+	ctx = WithUserImages(ctx, nil)
+	return WithDirectImageTurn(ctx, false)
+}
+
 func userImages(ctx context.Context) []string {
 	images, _ := ctx.Value(userImagesContextKey{}).([]string)
 	return images
+}
+
+// WithDirectImageTurn marks a user turn whose images go straight to the main
+// model (ImageRouteDirectMain). The planner cannot see raw images, so the
+// coordinator keeps such turns on the image-capable executor provider.
+func WithDirectImageTurn(ctx context.Context, direct bool) context.Context {
+	return context.WithValue(ctx, directImageTurnContextKey{}, direct)
+}
+
+// DirectImageTurn reports whether the turn's images are direct-to-main.
+func DirectImageTurn(ctx context.Context) bool {
+	direct, _ := ctx.Value(directImageTurnContextKey{}).(bool)
+	return direct
 }
 
 // Gate decides, per tool call, whether it may run. The agent consults it at
@@ -274,8 +296,15 @@ type Agent struct {
 	pricing              *provider.Pricing
 	usageSource          string
 	modelRef             string
-	responseLanguage     atomic.Value // string: auto|zh|en
-	reasoningLanguage    atomic.Value // string: auto|zh|en
+	// toolImages routes images returned by tool calls before the tool message
+	// enters the session (see Options.ToolImages). modelSupportsImages is the
+	// local, metadata-only verdict for this agent's model (see
+	// Options.ModelSupportsImages): when true, tool images are never routed to
+	// the vision fallback.
+	toolImages          vision.ToolImageProcessor
+	modelSupportsImages bool
+	responseLanguage    atomic.Value // string: auto|zh|en
+	reasoningLanguage   atomic.Value // string: auto|zh|en
 
 	// sink receives the turn's typed event stream (reasoning/text deltas, tool
 	// dispatch/results, usage, notices). The agent no longer formats output
@@ -1120,6 +1149,22 @@ type Options struct {
 	// (or cloned for) sub-agents. nil disables v2 capture. Does not affect
 	// provider-visible tool schemas or prompts.
 	MutationObserver *checkpoint.MutationObserver
+
+	// ToolImages is the optional post-processor for images returned by tool
+	// calls (read_file, MCP screenshots). When set, tool results carrying
+	// images are routed through it before the tool message enters the session:
+	// a vision-capable agent model keeps the originals, a text model receives
+	// the vision-model description instead. When nil, images ride the message
+	// untouched (vision-capable providers embed them; text providers skip
+	// them) — the host falls back to appending an "images could not be read"
+	// status and dropping the images for text models.
+	ToolImages vision.ToolImageProcessor
+	// ModelSupportsImages reports whether this agent's model accepts image
+	// input directly (config.EffectiveVision of the resolved model). When
+	// true, tool images stay on the message for the provider instead of being
+	// described by the vision fallback — a multimodal model must never pay a
+	// vision-model round trip for images it can read itself.
+	ModelSupportsImages bool
 }
 
 // New constructs an Agent. MaxSteps <= 0 means no cap — the run loop continues
@@ -1198,6 +1243,8 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		pricing:                   opts.Pricing,
 		usageSource:               usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
 		modelRef:                  strings.TrimSpace(opts.ModelRef),
+		toolImages:                opts.ToolImages,
+		modelSupportsImages:       opts.ModelSupportsImages,
 		sink:                      sink,
 		gate:                      gate,
 		recoveryGate:              opts.RecoveryGate,

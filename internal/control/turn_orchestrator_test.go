@@ -1125,3 +1125,81 @@ func (r *compactingErrorRunner) Run(_ context.Context, input string) error {
 	})
 	return r.err
 }
+
+func TestTurnOrchestratorPromptSubmitBlockSkipsVisionAndMainModel(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeRouterTestConfig(t, dir)
+	ref, err := SaveImageDataURL("data:image/png;base64," + tinyPNG)
+	if err != nil {
+		t.Fatalf("SaveImageDataURL: %v", err)
+	}
+	desc := &fakeDescriber{}
+	runner := &fakeTurnRunner{}
+	hooks := hook.NewRunner([]hook.ResolvedHook{{
+		HookConfig: hook.HookConfig{Command: "block", PayloadFormat: "claude"},
+		Event:      hook.UserPromptSubmit,
+	}}, dir, func(context.Context, hook.SpawnInput) hook.SpawnResult {
+		return hook.SpawnResult{Stdout: `{"decision":"block","reason":"test"}`}
+	}, nil)
+	c := New(Options{
+		Runner:          runner,
+		ModelRef:        "custom/text-only",
+		WorkspaceRoot:   dir,
+		SessionDir:      filepath.Join(dir, "sessions"),
+		VisionModelRef:  "custom/qwen-vl",
+		VisionDescriber: desc,
+		Hooks:           hooks,
+		SystemPrompt:    "sys",
+	})
+	if err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), "look at @"+ref, "look at @"+ref, ""); err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+	if desc.count() != 0 {
+		t.Fatalf("vision model called %d times despite a blocking UserPromptSubmit hook", desc.count())
+	}
+	if len(runner.inputs) != 0 {
+		t.Fatalf("main model called %d times despite a blocking UserPromptSubmit hook", len(runner.inputs))
+	}
+}
+
+func TestTurnOrchestratorVisionDescriptionInjectsTextNotRawImages(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeRouterTestConfig(t, dir)
+	ref, err := SaveImageDataURL("data:image/png;base64," + tinyPNG)
+	if err != nil {
+		t.Fatalf("SaveImageDataURL: %v", err)
+	}
+	desc := &fakeDescriber{description: "截图显示报错：cannot find module"}
+	runner := &fakeTurnRunner{}
+	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	c := New(Options{
+		Runner:          runner,
+		Executor:        exec,
+		ModelRef:        "custom/text-only",
+		WorkspaceRoot:   dir,
+		SessionDir:      filepath.Join(dir, "sessions"),
+		SessionPath:     filepath.Join(dir, "sessions", "session.jsonl"),
+		VisionModelRef:  "custom/qwen-vl",
+		VisionDescriber: desc,
+		SystemPrompt:    "sys",
+	})
+	if err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), "look at @"+ref, "look at @"+ref, ""); err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+	if desc.count() != 1 {
+		t.Fatalf("vision calls = %d, want exactly 1", desc.count())
+	}
+	if len(runner.inputs) != 1 {
+		t.Fatalf("main model calls = %d, want 1", len(runner.inputs))
+	}
+	if !strings.Contains(runner.inputs[0], "<vision-description") || !strings.Contains(runner.inputs[0], "cannot find module") {
+		t.Fatalf("main model input missing injected description: %q", runner.inputs[0])
+	}
+	// The raw image must not reach the main model input (route.Images is nil in
+	// fallback mode; the description text replaces it).
+	if strings.Contains(runner.inputs[0], "base64") {
+		t.Fatalf("raw image leaked into main model input: %q", runner.inputs[0])
+	}
+}

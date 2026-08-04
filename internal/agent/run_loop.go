@@ -10,6 +10,7 @@ import (
 	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
 	"reasonix/internal/provider"
+	"reasonix/internal/vision"
 )
 
 // runLoopState holds per-Run loop counters and flags. It is package-private and
@@ -570,6 +571,82 @@ func (a *Agent) handleFinalResponse(ctx context.Context, state *runLoopState, te
 	return false, nil // model gave a final answer
 }
 
+// toolImageTaskContextLimit bounds the user-message snippet forwarded to the
+// vision model as task context — enough to orient it, never the transcript.
+const toolImageTaskContextLimit = 2 * 1024
+
+// processToolImages routes every tool result's images through the shared
+// vision processor, in call order. Results with no images pass through
+// untouched. The processor returns the final tool text and the images to keep
+// on the tool message (nil when they were described or dropped).
+func (a *Agent) processToolImages(ctx context.Context, calls []provider.ToolCall, results []string, images [][]string) ([]string, [][]string) {
+	if a.toolImages == nil {
+		return results, images
+	}
+	taskContext := a.currentTaskContext()
+	for i := range calls {
+		if len(images[i]) == 0 {
+			continue
+		}
+		out := a.toolImages.ProcessToolImages(ctx, vision.ToolImageInput{
+			ToolName:            calls[i].Name,
+			ToolCallID:          calls[i].ID,
+			ToolText:            results[i],
+			Images:              images[i],
+			ModelRef:            a.modelRef,
+			ModelSupportsImages: a.modelSupportsImages,
+			TaskContext:         taskContext,
+			MaxTextBytes:        maxToolOutputBytes,
+		})
+		results[i] = out.Text
+		images[i] = out.Images
+	}
+	return results, images
+}
+
+// currentTaskContext returns a bounded, user-authored task snippet so the
+// secondary vision provider can orient itself without receiving host-composed
+// controller context or sub-agent framing.
+func (a *Agent) currentTaskContext() string {
+	// Sub-agent spawners capture their pristine child task before adding host
+	// framing. Their context may still inherit the root turn's RawUserInput, so
+	// this trusted child-specific value must take precedence.
+	if content := strings.TrimSpace(a.classifierTaskText); content != "" {
+		return boundToolImageTaskContext(content)
+	}
+	if a.session == nil || a.session.Len() == 0 {
+		return ""
+	}
+	msgs := a.session.Snapshot()
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != provider.RoleUser {
+			continue
+		}
+		content := strings.TrimSpace(msgs[i].RawContent)
+		if content == "" {
+			// Direct Agent callers have no host-composed layer, so Content is
+			// already the user-authored task when RawContent is absent.
+			content = strings.TrimSpace(msgs[i].Content)
+		}
+		if content == "" {
+			continue
+		}
+		return boundToolImageTaskContext(content)
+	}
+	return ""
+}
+
+func boundToolImageTaskContext(content string) string {
+	if len(content) <= toolImageTaskContextLimit {
+		return content
+	}
+	cut := toolImageTaskContextLimit
+	for cut > 0 && content[cut]&0xc0 == 0x80 {
+		cut--
+	}
+	return content[:cut] + "……[已截断]……"
+}
+
 // handleToolRound executes a tool batch, persists tool messages, handles
 // cancellation, todo stall tracking, recovery finalization pause, and the
 // max-steps grace round. cont=true continues the tool loop; cont=false returns
@@ -614,6 +691,22 @@ func (a *Agent) handleToolRound(ctx context.Context, state *runLoopState, step i
 	}
 	batch := a.executeBatch(ctx, calls)
 	results, images := batch.results, batch.images
+	// Tool-image routing happens after the batch executes and before the tool
+	// messages enter the session, so MCP screenshots and read_file images share
+	// one pipeline, the pairing of tool-call/tool-result stays intact, and a
+	// text agent never receives raw images it cannot process.
+	if a.toolImages != nil {
+		results, images = a.processToolImages(ctx, calls, results, images)
+	} else {
+		// No processor wired (direct construction / tests): a text model must
+		// still never receive raw images, so drop them and say so honestly.
+		for i := range calls {
+			if len(images[i]) > 0 && !a.modelSupportsImages {
+				images[i] = nil
+				results[i] = vision.AppendToolImageStatusWithin(results[i], calls[i].Name, maxToolOutputBytes)
+			}
+		}
+	}
 	for i, call := range calls {
 		a.session.Add(provider.Message{
 			Role:       provider.RoleTool,
