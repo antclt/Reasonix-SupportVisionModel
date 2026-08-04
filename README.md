@@ -1,4 +1,4 @@
- <img src="docs/logo.svg" alt="Reasonix" width="640"/>
+   <img src="docs/logo.svg" alt="Reasonix" width="640"/>
 </p>
 
 <h1 align="center">Reasonix Support Vision Model</h1>
