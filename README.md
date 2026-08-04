@@ -1,5 +1,4 @@
-<img width="1833" height="1202" alt="image" src="https://github.com/user-attachments/assets/a26a615a-a6de-42fe-a709-32b58e20cb6a" /><p align="center">
-  <img src="docs/logo.svg" alt="Reasonix" width="640"/>
+ <img src="docs/logo.svg" alt="Reasonix" width="640"/>
 </p>
 
 <h1 align="center">Reasonix Support Vision Model</h1>
