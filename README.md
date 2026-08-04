@@ -1,4 +1,4 @@
-<p align="center">
+<img width="1833" height="1202" alt="image" src="https://github.com/user-attachments/assets/a26a615a-a6de-42fe-a709-32b58e20cb6a" /><p align="center">
   <img src="docs/logo.svg" alt="Reasonix" width="640"/>
 </p>
 
@@ -25,6 +25,7 @@
 
 Reasonix 原本已经支持多模态模型直接接收用户图片。本项目在此基础上增加了一条视觉回退链路：
 当当前主模型不支持图片时，可以从**已经配置的模型**中选择一个“识图模型”，先把图片转换成文字描述，再把描述和用户原问题交给主模型继续分析、写代码和调用工具。
+<img width="1833" height="1202" alt="image" src="https://github.com/user-attachments/assets/6f9a822c-c7e1-4bd0-9c45-c75af7365d16" />
 
 本项目不会要求用户再配置一套独立的 Vision Provider。识图模型和主模型一样，来自现有 Provider 与模型列表。
 
