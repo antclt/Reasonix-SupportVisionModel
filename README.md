@@ -25,6 +25,7 @@
 
 Reasonix 原本已经支持多模态模型直接接收用户图片。本项目在此基础上增加了一条视觉回退链路：
 当当前主模型不支持图片时，可以从**已经配置的模型**中选择一个“识图模型”，先把图片转换成文字描述，再把描述和用户原问题交给主模型继续分析、写代码和调用工具。
+<img width="1833" height="1202" alt="image" src="https://github.com/user-attachments/assets/6f9a822c-c7e1-4bd0-9c45-c75af7365d16" />
 
 本项目不会要求用户再配置一套独立的 Vision Provider。识图模型和主模型一样，来自现有 Provider 与模型列表。
 
@@ -187,15 +188,9 @@ git push origin main-v2
 - 当前开发分支：`main-v2`
 - 许可证：[MIT License](./LICENSE)
 
-感谢 Reasonix 原项目维护者和所有贡献者。本项目保留上游提交历史，并在其基础上维护视觉模型路由相关改动。
+感谢 Reasonix 原项目维护者和所有贡献者。本项目保留上游提交历史，并在其基础上维护视觉模型路由相关改动，会尽量跟进Reasonix的更新。
 
-## 支持本项目
 
-如果这个二次开发版本帮你解决了文本模型无法读图的问题，可以通过微信支持后续维护。支持完全自愿，不代表功能优先级，也不影响问题处理顺序。
-
-<p align="center">
-  <img src=".github/sponsor/wechat-pay.png" alt="微信支付收款码" width="320"/>
-</p>
 
 ---
 
