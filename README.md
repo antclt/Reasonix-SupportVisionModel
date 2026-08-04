@@ -173,15 +173,9 @@ git push origin main-v2
 - 当前开发分支：`main-v2`
 - 许可证：[MIT License](./LICENSE)
 
-感谢 Reasonix 原项目维护者和所有贡献者。本项目保留上游提交历史，并在其基础上维护视觉模型路由相关改动。
+感谢 Reasonix 原项目维护者和所有贡献者。本项目保留上游提交历史，并在其基础上维护视觉模型路由相关改动，会尽量跟进Reasonix的更新。
 
-## 支持本项目
 
-如果这个二次开发版本帮你解决了文本模型无法读图的问题，可以通过微信支持后续维护。支持完全自愿，不代表功能优先级，也不影响问题处理顺序。
-
-<p align="center">
-  <img src=".github/sponsor/wechat-pay.png" alt="微信支付收款码" width="320"/>
-</p>
 
 ---
 
