@@ -75,6 +75,20 @@ flowchart TD
 
 这些场景可以后续继续扩展，不影响当前用户附件和本地文件图片的识别链路。
 
+## 下载 Windows 安装包
+
+已经发布的 Windows x64 安装版和便携版可以从
+[GitHub Releases](https://github.com/Junjie88/Reasionix-SupportVisionModel/releases)
+下载。
+
+- `Reasonix-windows-amd64-installer.exe`：Windows x64 安装版。
+- `Reasonix-windows-amd64.zip`：Windows x64 便携版。
+- `SHA256SUMS`：安装包和便携包的 SHA256 校验值。
+
+> [!WARNING]
+> 当前社区版本没有商业代码签名，Windows SmartScreen 可能显示“未知发布者”。
+> 请只从本仓库 Releases 页面下载，并在运行前核对 SHA256。
+
 ## 使用方法
 
 ### 桌面端设置

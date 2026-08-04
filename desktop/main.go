@@ -49,6 +49,12 @@ var version = "dev"
 // preview for compatibility.
 var channel = "stable"
 
+// releaseRepository identifies the GitHub repository that publishes this
+// build. Official builds keep the default value. Community forks inject their
+// own owner/repository at build time so they never offer an official Reasonix
+// release as an in-place update over fork-specific code.
+var releaseRepository = "esengine/DeepSeek-Reasonix"
+
 // macSelfUpdate is injected as "true" only for Developer ID signed + notarized
 // macOS release builds. Local/ad-hoc macOS builds keep the manual download path.
 var macSelfUpdate = "false"
@@ -65,6 +71,18 @@ func macSelfUpdateAllowed() bool {
 	default:
 		return false
 	}
+}
+
+func usesOfficialReleaseRepository() bool {
+	return strings.EqualFold(strings.Trim(strings.TrimSpace(releaseRepository), "/"), "esengine/DeepSeek-Reasonix")
+}
+
+func releasePageURL() string {
+	repo := strings.Trim(strings.TrimSpace(releaseRepository), "/")
+	if repo == "" {
+		repo = "esengine/DeepSeek-Reasonix"
+	}
+	return "https://github.com/" + repo + "/releases"
 }
 
 func windowsWebview2GPUDisabled() bool {

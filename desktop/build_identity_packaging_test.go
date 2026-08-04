@@ -16,7 +16,8 @@ func TestDesktopBuildLinksSharedSourceRevision(t *testing.T) {
 		`SOURCE_REVISION="$(git -C "$ROOT" rev-parse --verify HEAD)"`,
 		`SOURCE_REVISION="$SOURCE_REVISION+dirty"`,
 		`source_revision_ldflag="-X reasonix/internal/remote/protocol.linkedSourceRevision=$SOURCE_REVISION"`,
-		`ldflags="-X main.version=$VERSION -X main.channel=$CHANNEL $source_revision_ldflag"`,
+		`RELEASE_REPOSITORY="${REASONIX_RELEASE_REPOSITORY:-esengine/DeepSeek-Reasonix}"`,
+		`ldflags="-X main.version=$VERSION -X main.channel=$CHANNEL -X main.releaseRepository=$RELEASE_REPOSITORY $source_revision_ldflag"`,
 		`-X main.version=$VERSION $source_revision_ldflag`,
 	} {
 		if !strings.Contains(script, want) {

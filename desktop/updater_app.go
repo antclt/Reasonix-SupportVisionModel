@@ -82,6 +82,16 @@ func (a *App) Version() string { return version }
 // surfaces in UpdateInfo.Err rather than failing, so the UI can stay quiet.
 func (a *App) CheckUpdate(selectedChannel string) (*UpdateInfo, error) {
 	selectedChannel = targetUpdateChannel(selectedChannel)
+	if !usesOfficialReleaseRepository() {
+		return &UpdateInfo{
+			Current:      version,
+			Latest:       version,
+			Channel:      selectedChannel,
+			ManualOnly:   true,
+			ManualReason: "This community build is updated from its GitHub Releases page.",
+			DownloadURL:  releasePageURL(),
+		}, nil
+	}
 	profile := detectInstallProfile()
 	c, err := httpClient()
 	if err != nil {
@@ -127,6 +137,12 @@ func (a *App) OpenDownloadPage() {
 }
 
 func (a *App) openDownloadPage(selectedChannel string) {
+	if !usesOfficialReleaseRepository() {
+		if a.ctx != nil {
+			wruntime.BrowserOpenURL(a.ctx, releasePageURL())
+		}
+		return
+	}
 	selectedChannel = targetUpdateChannel(selectedChannel)
 	page := downloadPage(selectedChannel)
 	if c, err := httpClient(); err == nil {

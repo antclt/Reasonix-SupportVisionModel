@@ -1,0 +1,105 @@
+name: Release vision desktop
+
+on:
+  push:
+    tags:
+      - "desktop-v*-vision.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-vision-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-amd64:
+    name: Build Windows x64 installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: desktop/go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            desktop/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.18.0
+
+      - name: Install NSIS
+        shell: pwsh
+        run: ./scripts/install-nsis.ps1
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Resolve release version
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#desktop-}" >> "$GITHUB_ENV"
+
+      - name: Build installer and portable package
+        env:
+          REASONIX_RELEASE_REPOSITORY: ${{ github.repository }}
+        run: scripts/desktop-build.sh windows/amd64 "$RELEASE_VERSION" stable
+
+      - name: Verify release files and write checksums
+        run: |
+          test -s dist/Reasonix-windows-amd64-installer.exe
+          test -s dist/Reasonix-windows-amd64.zip
+          cd dist
+          sha256sum Reasonix-windows-amd64-installer.exe Reasonix-windows-amd64.zip > SHA256SUMS
+
+      - name: Write release notes
+        run: |
+          cat > release-notes.md <<EOF
+          ## Reasonix Support Vision Model
+
+          这是基于 Reasonix 二次开发的首个 Windows x64 安装包版本。
+
+          ### 主要功能
+
+          - 从现有模型中选择识图模型，不需要新增独立 Provider。
+          - 文本主模型收到图片时，由识图模型转换为文字后继续处理。
+          - 主模型原生支持图片时，原始图片仍直接交给主模型。
+          - 支持用户附件、read_file 本地图片和 MCP 结构化图片结果。
+          - 单批图片最多 3 次真实识图请求。
+
+          ### 下载
+
+          - Reasonix-windows-amd64-installer.exe：Windows x64 安装版。
+          - Reasonix-windows-amd64.zip：Windows x64 便携版。
+          - SHA256SUMS：文件完整性校验。
+
+          > 这是社区二次开发版本，不是 Reasonix 官方发行版。安装包目前没有商业代码签名，Windows SmartScreen 可能显示未知发布者。请核对 SHA256 后再安装。
+          EOF
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/Reasonix-windows-amd64-installer.exe
+          dist/Reasonix-windows-amd64.zip
+          dist/SHA256SUMS
+          --verify-tag
+          --prerelease
+          --title "Reasonix Vision ${RELEASE_VERSION}"
+          --notes-file release-notes.md

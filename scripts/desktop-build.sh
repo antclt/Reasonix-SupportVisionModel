@@ -20,6 +20,7 @@ set -euo pipefail
 PLATFORM="${1:?usage: desktop-build.sh <os/arch> <version> [channel]}"
 VERSION="${2:?usage: desktop-build.sh <os/arch> <version> [channel]}"
 CHANNEL="${3:-stable}"
+RELEASE_REPOSITORY="${REASONIX_RELEASE_REPOSITORY:-esengine/DeepSeek-Reasonix}"
 
 os="${PLATFORM%/*}"
 arch="${PLATFORM#*/}"
@@ -106,7 +107,7 @@ numver="${VERSION#v}"; numver="${numver%%-*}"
 node -e 'const fs=require("fs"),f="wails.json",j=JSON.parse(fs.readFileSync(f,"utf8"));j.info.productVersion=process.argv[1];fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n")' "$numver"
 
 # NSIS installer is Windows-only (Wails requires a single windows target for -nsis).
-ldflags="-X main.version=$VERSION -X main.channel=$CHANNEL $source_revision_ldflag"
+ldflags="-X main.version=$VERSION -X main.channel=$CHANNEL -X main.releaseRepository=$RELEASE_REPOSITORY $source_revision_ldflag"
 [ "$os" = "darwin" ] && [ "${HAS_APPLE_CERT:-}" = "true" ] && ldflags="$ldflags -X main.macSelfUpdate=true"
 UPDATE_HELPER="reasonix-update-helper.exe"
 if [ "$os" = windows ]; then
