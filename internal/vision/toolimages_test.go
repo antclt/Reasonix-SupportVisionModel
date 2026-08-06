@@ -15,7 +15,6 @@ import (
 // scriptedDescriber streams fixed results and counts calls, letting tests
 // drive the retry budget precisely.
 type scriptedDescriber struct {
-	name    string
 	mu      sync.Mutex
 	calls   int
 	results []string // one per call; empty string = failure

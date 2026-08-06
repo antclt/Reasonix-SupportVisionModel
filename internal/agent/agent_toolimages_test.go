@@ -35,22 +35,6 @@ func (f *fakeToolImageProcessor) inputs() []vision.ToolImageInput {
 
 const shotDataURL = "data:image/png;base64,QUFB"
 
-func runShotTurn(t *testing.T, opts Options) (*Agent, *fakeToolImageProcessor, *Session) {
-	t.Helper()
-	reg := tool.NewRegistry()
-	reg.Add(&fakeImageTool{text: "已读取图片文件：shot.png", images: []string{shotDataURL}})
-	prov := &scriptedProvider{name: "p", turns: [][]provider.Chunk{
-		{toolCallChunk("c1", "shot", `{}`), {Type: provider.ChunkDone}},
-		{{Type: provider.ChunkText, Text: "done"}, {Type: provider.ChunkDone}},
-	}}
-	sess := NewSession("sys")
-	a := New(prov, reg, sess, opts, event.Discard)
-	if err := a.Run(context.Background(), "look at the screenshot"); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	return a, nil, sess
-}
-
 func toolMessageImages(s *Session, name string) []string {
 	for i := range s.Messages {
 		if s.Messages[i].Role == provider.RoleTool && s.Messages[i].Name == name {

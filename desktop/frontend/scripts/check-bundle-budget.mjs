@@ -53,9 +53,9 @@ if (localeChunks.length !== 2) {
 for (const path of localeChunks) {
   const name = basename(path);
   // Task Monitor adds 37 user-facing labels to each on-demand locale, while
-  // Extension UI adds its own status and action copy. Keep both dictionaries
-  // within narrowly measured, explicit allowances.
-  const budget = name.startsWith("zh-TW-") ? 53.25 * 1024 : 52.5 * 1024;
+  // Extension UI and vision-model settings add their own status and action
+  // copy. Keep both dictionaries within narrowly measured allowances.
+  const budget = name.startsWith("zh-TW-") ? 53.5 * 1024 : 52.75 * 1024;
   assertBudget(`${name} gzip`, gzipBytes(path), budget);
 }
 

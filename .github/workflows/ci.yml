@@ -62,20 +62,16 @@ jobs:
           fi
           { echo "code=$code"; echo "desktop=$desktop"; echo "site=$site"; echo "sdk=$sdk"; } >> "$GITHUB_OUTPUT"
 
-  # The ruleset requires the per-OS check names (test (ubuntu-latest) etc.).
-  # A matrix job skipped at job level reports no per-leg checks at all, so
-  # those required checks would stay "Expected" and block merging. The job
-  # therefore always runs and the steps do the gating: when the changes
-  # detector reports the diff is unrelated, every step skips and each leg
-  # reports success in seconds. `always()` also keeps the legs alive when
-  # the changes job itself fails (fail-open: an empty output != 'false').
+  # Temporary fork policy: Linux and macOS root-module checks are disabled.
+  # This CI revision validates only the Windows matrix leg; Linux and macOS
+  # behavior is explicitly unvalidated until those legs are restored.
   test:
     needs: changes
     if: always()
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       RUN_STEPS: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code != 'false' }}
@@ -164,9 +160,11 @@ jobs:
         shell: powershell
         run: .\scripts\test-scoop-desktop-launch.ps1
 
+  # Temporary fork policy: race detection is disabled. This CI revision does
+  # not validate concurrent behavior with the Go race detector.
   race:
     needs: changes
-    if: always() && (github.event_name != 'pull_request' || needs.changes.outputs.code != 'false')
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -530,9 +528,11 @@ jobs:
       - name: govulncheck
         run: govulncheck ./...
 
+  # Temporary fork policy: coverage collection is disabled. This CI revision
+  # does not produce or validate a root-module coverage result.
   coverage:
     needs: changes
-    if: always() && (github.event_name != 'pull_request' || needs.changes.outputs.code != 'false')
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

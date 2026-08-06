@@ -16,7 +16,6 @@ import (
 type fakeProvider struct {
 	name  string
 	chunk []provider.Chunk
-	once  bool
 	mu    sync.Mutex
 	req   provider.Request
 	ctx   context.Context
