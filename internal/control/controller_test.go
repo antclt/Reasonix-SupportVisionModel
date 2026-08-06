@@ -39,6 +39,47 @@ type typedNilControllerSink struct{}
 
 func (*typedNilControllerSink) Emit(event.Event) {}
 
+func TestResolvePlanDecisionRecordsDistinctOutcomes(t *testing.T) {
+	tests := []struct {
+		action PlanDecisionAction
+		allow  bool
+	}{
+		{action: PlanDecisionStartExecution, allow: true},
+		{action: PlanDecisionRevisePlan, allow: false},
+		{action: PlanDecisionExitPlan, allow: false},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.action), func(t *testing.T) {
+			session := agent.NewSession("sys")
+			session.Add(provider.Message{Role: provider.RoleAssistant, Content: "proposed plan"})
+			exec := agent.New(nil, nil, session, agent.Options{}, event.Discard)
+			c := New(Options{Executor: exec})
+			id, reply := c.approval.registerDecisionKind(planApprovalTool, "", "", true, false, "plan", nil)
+
+			if err := c.ResolvePlanDecision(id, tt.action); err != nil {
+				t.Fatalf("ResolvePlanDecision: %v", err)
+			}
+			select {
+			case got := <-reply:
+				if got.allow != tt.allow {
+					t.Fatalf("reply allow = %v, want %v", got.allow, tt.allow)
+				}
+			default:
+				t.Fatal("plan decision did not unblock the approval waiter")
+			}
+
+			messages := session.Snapshot()
+			if len(messages) != 2 || len(messages[1].DecisionReceipts) != 1 {
+				t.Fatalf("persisted messages = %+v, want receipt attached to plan answer", messages)
+			}
+			receipt := messages[1].DecisionReceipts[0]
+			if receipt.Kind != "plan" || receipt.Outcome != string(tt.action) {
+				t.Fatalf("receipt = %+v, want plan/%s", receipt, tt.action)
+			}
+		})
+	}
+}
+
 func isolateControlConfigHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
@@ -740,7 +781,8 @@ func TestSnapshotAdoptsNewerDiskForPureStalePrefix(t *testing.T) {
 	staleSess.Add(provider.Message{Role: provider.RoleUser, Content: "first"})
 	staleSess.Add(provider.Message{Role: provider.RoleAssistant, Content: "one"})
 	staleExec := agent.New(nil, nil, staleSess, agent.Options{}, event.Discard)
-	stale := New(Options{Executor: staleExec, SessionDir: dir, SessionPath: path, Label: "test"})
+	sink := &noticeSink{}
+	stale := New(Options{Executor: staleExec, SessionDir: dir, SessionPath: path, Label: "test", Sink: sink})
 
 	currentSess := agent.NewSession("sys")
 	currentSess.Add(provider.Message{Role: provider.RoleUser, Content: "first"})
@@ -769,6 +811,10 @@ func TestSnapshotAdoptsNewerDiskForPureStalePrefix(t *testing.T) {
 	}
 	if got := len(stale.executor.Session().Snapshot()); got != 5 {
 		t.Fatalf("stale controller adopted message count = %d, want 5", got)
+	}
+	notice, ok := sink.lastNotice()
+	if !ok || notice.Code != event.NoticeCodeSessionRecoveryAdopted || notice.Audience != event.NoticeAudienceOperator {
+		t.Fatalf("adoption notice = %+v, want typed operator recovery notice", notice)
 	}
 }
 
@@ -1219,7 +1265,11 @@ func TestRecoveryBranchPersistsLaterOwnedCompactionRewrite(t *testing.T) {
 	}
 	notices := sink.notices()
 	if len(notices) == 0 {
-		t.Fatal("initial recovery emitted no user notice")
+		t.Fatal("initial recovery emitted no operator notice")
+	}
+	notice, ok := sink.lastNotice()
+	if !ok || notice.Code != event.NoticeCodeSessionRecoveryForked || notice.Audience != event.NoticeAudienceOperator {
+		t.Fatalf("fork recovery notice = %+v, want typed operator recovery notice", notice)
 	}
 	if got := notices[len(notices)-1]; strings.Contains(got, agent.BranchID(recoveryPath)) || strings.Contains(got, "recovery branch") {
 		t.Fatalf("initial recovery notice exposed internal branch detail: %q", got)
@@ -1357,11 +1407,13 @@ func TestRecoverShutdownSnapshotPersistsAndReanchorsSession(t *testing.T) {
 	current.Add(provider.Message{Role: provider.RoleAssistant, Content: "shutdown tail"})
 	exec := agent.New(nil, nil, current, agent.Options{}, event.Discard)
 	var handoff SessionRecoveryInfo
+	sink := &noticeSink{}
 	c := New(Options{
 		Executor:    exec,
 		SessionDir:  dir,
 		SessionPath: path,
 		Label:       "shutdown",
+		Sink:        sink,
 		OnSessionRecovered: func(info SessionRecoveryInfo) error {
 			handoff = info
 			return nil
@@ -1387,6 +1439,10 @@ func TestRecoverShutdownSnapshotPersistsAndReanchorsSession(t *testing.T) {
 	}
 	if got := recovered.Snapshot(); len(got) != 3 || got[2].Content != "shutdown tail" {
 		t.Fatalf("shutdown recovery transcript = %+v", got)
+	}
+	notice, ok := sink.lastNotice()
+	if !ok || notice.Code != event.NoticeCodeSessionShutdownRecoveryForked || notice.Audience != event.NoticeAudienceOperator {
+		t.Fatalf("shutdown recovery notice = %+v, want typed operator recovery notice", notice)
 	}
 }
 
@@ -1984,6 +2040,22 @@ type noticeSink struct {
 	events []event.Event
 }
 
+func TestSessionRecoveryNoticesAreOperatorScoped(t *testing.T) {
+	for _, code := range []string{
+		event.NoticeCodeSessionRecoveryForked,
+		event.NoticeCodeSessionRecoveryAdopted,
+		event.NoticeCodeSessionRecoveryAdoptedCovered,
+		event.NoticeCodeSessionRecoveryDepthCap,
+		event.NoticeCodeSessionShutdownRecoveryForked,
+	} {
+		notice := sessionRecoveryNotice(code, "maintenance")
+		if notice.Kind != event.Notice || notice.Level != event.LevelWarn ||
+			notice.Audience != event.NoticeAudienceOperator || notice.Code != code {
+			t.Fatalf("session recovery notice %q = %+v, want typed operator warning", code, notice)
+		}
+	}
+}
+
 func (s *noticeSink) Emit(e event.Event) {
 	s.mu.Lock()
 	s.events = append(s.events, e)
@@ -2000,6 +2072,17 @@ func (s *noticeSink) notices() []string {
 		}
 	}
 	return out
+}
+
+func (s *noticeSink) lastNotice() (event.Event, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.events) - 1; i >= 0; i-- {
+		if s.events[i].Kind == event.Notice {
+			return s.events[i], true
+		}
+	}
+	return event.Event{}, false
 }
 
 func TestSnapshotConflictAtRecoveryDepthCapForceSavesCurrentBranch(t *testing.T) {
@@ -2054,6 +2137,10 @@ func TestSnapshotConflictAtRecoveryDepthCapForceSavesCurrentBranch(t *testing.T)
 	notices := sink.notices()
 	if len(notices) == 0 || !strings.Contains(notices[len(notices)-1], "saved the current conflict copy in place") {
 		t.Fatalf("notices = %v, want depth-cap notice", notices)
+	}
+	notice, ok := sink.lastNotice()
+	if !ok || notice.Code != event.NoticeCodeSessionRecoveryDepthCap || notice.Audience != event.NoticeAudienceOperator {
+		t.Fatalf("depth-cap notice = %+v, want typed operator recovery notice", notice)
 	}
 	if stale.NeedsRewriteSave() {
 		t.Fatal("rewrite baseline not re-anchored by depth-cap force save")
@@ -5208,4 +5295,22 @@ func cmdNames(cmds []command.Command) []string {
 		names[i] = c.Name
 	}
 	return names
+}
+
+// TestCacheColdAfterFailureFallsBackTo24h：配置加载失败/模型解析失败时
+// 保守回退 24h（评审 #7168 第 4 点）——不得用 10m 提前触发 prune。
+func TestCacheColdAfterFailureFallsBackTo24h(t *testing.T) {
+	c := New(Options{})
+	orig := c.workspaceRoot
+	c.workspaceRoot = "/nonexistent/definitely-missing-root"
+	defer func() { c.workspaceRoot = orig }()
+	if got := c.cacheColdAfter(); got != 24*time.Hour {
+		t.Fatalf("load failure must fall back to 24h, got %v", got)
+	}
+	// 未知模型同样 24h
+	c2 := New(Options{})
+	c2.modelRef = "definitely-not-a-real-model-xyz"
+	if got := c2.cacheColdAfter(); got != 24*time.Hour {
+		t.Fatalf("ResolveModel failure must fall back to 24h, got %v", got)
+	}
 }

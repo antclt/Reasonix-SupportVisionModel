@@ -277,6 +277,9 @@ await act(async () => {
 
 const compactButton = Array.from(document.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Compact") as HTMLButtonElement | undefined;
 if (!compactButton) throw new Error("compact display mode button did not render");
+const generalFieldLabels = Array.from(rootEl.querySelectorAll(".settings-section__body > .settings-field > .settings-field__copy > .settings-field__label"))
+  .map((label) => label.textContent?.trim());
+eq(generalFieldLabels[0], "Desktop style", "general settings place desktop style first");
 eq(document.querySelectorAll(".step-limit-control").length, 0, "general settings hide executor and planner step-limit controls");
 ok(!document.body.textContent?.includes("step limit"), "general settings keep automatic progress free of step-limit copy");
 ok(!document.body.textContent?.includes("Automatic plan mode"), "general settings omit the retired automatic Plan Mode control");
@@ -304,7 +307,6 @@ let compactSettings = baseSettings("standard");
 delete compactSettings.agent.compactRatio; // Old backends omit the additive field.
 compactSettings.agent.effectiveCompactRatio = 0.75;
 compactSettings.agent.compactRatioOverridden = true;
-compactSettings.agent.compactRatioRemote = true;
 compactSettings.defaultModel = "context-provider/context-model";
 compactSettings.providers = [{
   name: "context-provider",
@@ -357,7 +359,6 @@ ok(compactRootEl.textContent?.includes("Automatic compaction threshold") === tru
 ok(compactRootEl.textContent?.includes("80,000 tokens") === true, "compact ratio shows the default model token threshold");
 ok(compactRootEl.textContent?.includes("Current threshold: 80% · Balanced") === true, "compact ratio summarizes the saved preset separately");
 ok(compactRootEl.textContent?.includes("effective threshold is 75%") === true, "project override shows the active effective threshold");
-ok(compactRootEl.textContent?.includes("changes only the local default") === true, "remote workbench scope is explicit");
 ok(compactRootEl.querySelector('input[aria-label="Custom compaction threshold percentage"]') === null, "custom compact ratio editor stays hidden on the default path");
 const balancedCompactButton = compactRootEl.querySelector('button[aria-label="80% · Balanced"]') as HTMLButtonElement | null;
 if (!balancedCompactButton) throw new Error("balanced compaction preset did not render");

@@ -735,7 +735,12 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		cm := chatMessage{
 			Role:       string(m.Role),
 			ToolCallID: m.ToolCallID,
-			Name:       m.Name,
+		}
+		if m.Role == provider.RoleTool {
+			// Always send the tool message's name, even when empty: strict
+			// backends (MiMo) 400 a tool result without the key (#4711).
+			name := m.Name
+			cm.Name = &name
 		}
 		// DeepSeek thinking mode 400s an assistant tool_calls turn whose
 		// reasoning_content KEY is absent from the request JSON ("reasoning_content
@@ -979,10 +984,13 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 			sawDone = true
 			break
 		}
+		if data == "" {
+			continue
+		}
 
 		var sr streamResponse
 		if err := json.Unmarshal([]byte(data), &sr); err != nil {
-			return emitted, fmt.Errorf("%s: decode stream: %w", c.name, err)
+			return emitted, provider.StreamDecodeError(c.name, data, err)
 		}
 		if sr.Error != nil {
 			return emitted, fmt.Errorf("%s: %s", c.name, sr.Error.Message)
@@ -1085,7 +1093,13 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 		return emitted, err
 	}
 	if stalled.Load() {
-		return emitted, fmt.Errorf("%s: stream stalled — no data for %s, connection likely dropped", c.name, idleTimeout)
+		// Wrap io.ErrUnexpectedEOF so streamWithReconnect treats a half-open
+		// stall — a proxy that drops silently mid-stream with no FIN/RST, the
+		// watchdog's primary target — as recoverable, identical to the clean-FIN
+		// idle-close just below. Without it the stall bypasses reconnect and
+		// hard-fails the turn instead of replaying (pre-output) or surfacing a
+		// retryable StreamInterruptedError (post-output).
+		return emitted, fmt.Errorf("%s: stream stalled — no data for %s, connection likely dropped: %w", c.name, idleTimeout, io.ErrUnexpectedEOF)
 	}
 	if err := scanner.Err(); err != nil {
 		return emitted, fmt.Errorf("%s: read stream: %w", c.name, err)
@@ -1267,7 +1281,12 @@ type chatMessage struct {
 	ReasoningContent *string        `json:"reasoning_content,omitempty"`
 	ToolCalls        []chatToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
-	Name             string         `json:"name,omitempty"`
+	// Name is the role=tool message's function name. A pointer so ordinary
+	// messages omit the key (byte-stable prefix), while tool messages always
+	// serialize it — even empty: strict OpenAI-compatible backends (MiMo, per
+	// its error table) reject a tool message whose `name` key is absent
+	// ("name is not set"), and OpenAI's spec requires the field on role=tool.
+	Name *string `json:"name,omitempty"`
 }
 
 type chatContentPart struct {

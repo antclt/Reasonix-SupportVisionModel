@@ -26,11 +26,13 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"reasonix/internal/ablation"
 	"reasonix/internal/agent"
 	"reasonix/internal/boot"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
+	"reasonix/internal/extension/providerext"
 	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/i18n"
 	"reasonix/internal/notify"
@@ -169,6 +171,8 @@ func Run(args []string, version string) int {
 	case "version", "--version", "-v":
 		fmt.Println("reasonix", version)
 		return 0
+	case "docs-manifest":
+		return docsManifestCommand(rest, version)
 	case "help", "--help", "-h":
 		usage()
 		return 0
@@ -260,6 +264,7 @@ type cliBuildOverrides struct {
 	HeadlessApprovalMode string
 	Stderr               io.Writer
 	OnSessionRecovered   func(control.SessionRecoveryInfo) error
+	Ablation             ablation.Set
 }
 
 func setupProfileWithOverrides(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink, profile string, overrides cliBuildOverrides) (*control.Controller, error) {
@@ -285,6 +290,7 @@ func cliProfileBuildOptions(modelName string, maxStepsOverride int, requireKey b
 		StatsSource:          "cli",
 		Stderr:               overrides.Stderr,
 		OnSessionRecovered:   overrides.OnSessionRecovered,
+		Ablation:             overrides.Ablation,
 	}
 }
 
@@ -462,6 +468,7 @@ func runAgent(args []string, version string) int {
 	maxSteps := fs.Int("max-steps", 0, "one-off max tool-call rounds (0 = automatic)")
 	showThinking := fs.Bool("show-thinking", false, "show thinking text instead of the collapsed thinking marker")
 	metricsPath := fs.String("metrics", "", "write a JSON token/cache/cost summary of the run to this path")
+	ablateFlag := fs.String("ablate", "", "benchmark arm: comma-separated subsystems to switch off (evidence, planner, subagent, retrieval, compaction; none|all)")
 	dir := fs.String("dir", "", "change to this directory first (project root); config, sandbox and file tools resolve from here")
 	cont := registerContinueFlag(fs)
 	resume := fs.String("resume", "", "resume a specific session file (non-interactive; takes precedence over --continue)")
@@ -504,6 +511,11 @@ func runAgent(args []string, version string) int {
 		format = runOutputEventsJSONL
 	}
 	profile, err := parseRuntimeProfile(*profileFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 2
+	}
+	ablated, err := ablation.Parse(*ablateFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 2
@@ -551,12 +563,14 @@ func runAgent(args []string, version string) int {
 	// --continue, matching the Resume call below.
 	resumePath := strings.TrimSpace(*resume)
 	if resumePath == "" && *cont {
-		sessions, err := agent.ListSessions(resolveCLISessionDir())
-		if err != nil || len(sessions) == 0 {
+		sessionDir := resolveCLISessionDir()
+		reclaimCLIRecoveryBranches(sessionDir)
+		session, ok := mostRecentSession(sessionDir)
+		if !ok {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
 		}
-		resumePath = sessions[0].Path
+		resumePath = session.Path
 	}
 	if *copySession && resumePath == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "--copy requires --resume or --continue")
@@ -663,6 +677,7 @@ func runAgent(args []string, version string) int {
 		WorkspaceRoot:        workspaceRoot,
 		HeadlessApprovalMode: permissions.approval,
 		OnSessionRecovered:   cliSessionRecoveredHandler(leases),
+		Ablation:             ablated,
 	}
 	ctrl, err := setupProfileWithOverrides(ctx, *model, *maxSteps, true, sink, profile, overrides)
 	if err != nil {
@@ -676,6 +691,7 @@ func runAgent(args []string, version string) int {
 		return 1
 	}
 	defer ctrl.Close()
+	SetTaskJobKiller(ctrlKillerAdapter{ctrl})
 	ctrl.ApplyHeadlessApprovalMode(permissions.approval)
 
 	// --resume: load a specific session file (non-interactive, meant for
@@ -694,6 +710,7 @@ func runAgent(args []string, version string) int {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, control.SessionInUseMessage(err)+"; "+control.SessionLeaseCloseHint)
 		return 1
 	}
+	reclaimCLIRecoveryBranches(ctrl.SessionDir())
 
 	runErr := ctrl.Run(ctx, prompt)
 	reporter.RecordRecovery(ctrl.DrainRecoveryMetrics())
@@ -706,6 +723,9 @@ func runAgent(args []string, version string) int {
 		})
 	}
 	if metrics != nil {
+		metrics.m.DurationMs = time.Since(started).Milliseconds()
+		metrics.m.Outcome = completion.class
+		metrics.m.Arm = ablated.Arm()
 		if exec := ctrl.Executor(); exec != nil {
 			if audit := exec.CapabilityAudit(); audit != nil {
 				snap := audit.Snapshot()
@@ -861,7 +881,10 @@ func runServe(args []string) int {
 	// ignoring project-level default_model overrides. Explicit flags and
 	// resumable session models remain strict and are preserved verbatim.
 	*model = resolveServeModel(*model)
-	ctrl, err := setupProfileWithOverrides(ctx, *model, *maxSteps, true, bc, profile, cliBuildOverrides{
+	// Keep the browser reachable when the selected provider has no saved key.
+	// The loopback-only provider setup surface stores the missing credential and
+	// rebuilds this controller in place before the normal web UI is exposed.
+	ctrl, err := setupProfileWithOverrides(ctx, *model, *maxSteps, false, bc, profile, cliBuildOverrides{
 		OnSessionRecovered: cliSessionRecoveredHandler(leases),
 	})
 	if err != nil {
@@ -869,6 +892,7 @@ func runServe(args []string) int {
 		return 1
 	}
 	defer ctrl.Close()
+	SetTaskJobKiller(ctrlKillerAdapter{ctrl})
 
 	// Auto-save target: reuse the resumed file, else a fresh one — same as chat.
 	if *resume != "" {
@@ -915,6 +939,7 @@ func runServe(args []string) int {
 		}
 		defer os.Remove(*pidFile)
 	}
+	srv.EnableProviderSetupForListener(displayAddr)
 
 	fmt.Printf("reasonix serve — %s on http://%s\n", ctrl.Label(), displayAddr)
 	if srv.AuthMode() == "token" {
@@ -935,14 +960,18 @@ func runServe(args []string) int {
 	if warning := serve.PlainHTTPAuthWarning(serveCfg, displayAddr); warning != "" {
 		fmt.Fprintf(os.Stderr, "  %s\n", warning)
 	}
-	// Diagnostic: check whether balance endpoint is reachable
-	if b, err := ctrl.Balance(context.Background()); err != nil {
-		fmt.Fprintf(os.Stderr, "  balance: error — %v\n", err)
-	} else if b == nil {
-		fmt.Fprintf(os.Stderr, "  balance: not configured (no balance_url for this provider)\n")
-	} else {
-		fmt.Printf("  balance: %s\n", b.Display())
-	}
+	// Balance is diagnostics, not readiness. Run it off the serving path so a
+	// slow or unauthenticated Provider endpoint cannot leave a published port
+	// file pointing at a listener whose HTTP accept loop has not started yet.
+	go func() {
+		if b, err := ctrl.Balance(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "  balance: error — %v\n", err)
+		} else if b == nil {
+			fmt.Fprintf(os.Stderr, "  balance: not configured (no balance_url for this provider)\n")
+		} else {
+			fmt.Printf("  balance: %s\n", b.Display())
+		}
+	}()
 
 	// Use graceful shutdown so SIGINT/SIGTERM drain active connections.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1047,12 +1076,14 @@ func chatREPL(args []string, version string) int {
 		}
 		resumePath = path
 	case *cont:
-		sessions, err := agent.ListSessions(resolveCLISessionDir())
-		if err != nil || len(sessions) == 0 {
+		sessionDir := resolveCLISessionDir()
+		reclaimCLIRecoveryBranches(sessionDir)
+		session, ok := mostRecentSession(sessionDir)
+		if !ok {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
 		}
-		resumePath = sessions[0].Path
+		resumePath = session.Path
 	}
 	if *copySession && resumePath == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "--copy requires --resume or --continue")
@@ -1148,6 +1179,7 @@ func chatREPL(args []string, version string) int {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, control.SessionInUseMessage(err)+"; "+control.SessionLeaseCloseHint)
 		return 1
 	}
+	reclaimCLIRecoveryBranches(ctrl.SessionDir())
 
 	// Surface a missing-key warning inside the TUI banner so the first message
 	// failing is at least pre-announced; the user can still enter chat.
@@ -1161,6 +1193,9 @@ func chatREPL(args []string, version string) int {
 		switch {
 		case err != nil:
 			missing = err.Error()
+		case name != "" && providerext.PluginRefOwner(name) != "":
+			// Plugin-namespaced refs hold no config credential; boot's merged
+			// resolver already gated them, and there is no key env to warn about.
 		case name != "":
 			if vErr := cfg.Validate(name); vErr != nil {
 				missing = vErr.Error()
@@ -1225,6 +1260,30 @@ func chatREPL(args []string, version string) int {
 			c.SetToolApprovalMode(spec.ToolApprovalMode)
 		}
 		return c, nil
+	}
+	// /reload support: rebuild the runtime through boot.Rebuild so tools,
+	// skills, commands, hooks, MCP servers, and providers are discovered fresh
+	// while the boot layer migrates the session (history, approval grants,
+	// goal/recovery state, lifecycle). Same construction inputs as
+	// buildController so the replacement matches this session's launch wiring;
+	// the CLI holds no SharedHost, so each rebuild owns its plugin host.
+	m.rebuildRuntime = func(ctx context.Context, spec controllerBuildSpec, old *control.Controller) (*boot.BuildResult, error) {
+		effectiveOverrides := overrides
+		if spec.EffortOverride != nil {
+			effectiveOverrides.Effort = spec.EffortOverride
+		}
+		res, err := boot.Rebuild(ctx, old, cliProfileBuildOptions(spec.ModelRef, *maxSteps, false, sink, spec.RuntimeProfile, effectiveOverrides))
+		if err != nil {
+			return nil, err
+		}
+		// The interactive approval gate and the --yolo posture are frontend
+		// wiring boot.Rebuild deliberately leaves to the caller (it carries
+		// the Ask/Auto/Yolo tool-approval mode, not the launch flag).
+		res.Controller.EnableInteractiveApproval()
+		if *yolo {
+			res.Controller.SetAutoApproveTools(true)
+		}
+		return res, nil
 	}
 	m.runtimeProfile = profile
 	if effortOverride != nil {
@@ -1489,8 +1548,10 @@ func interactiveSetup(configPath, envPath string) int {
 // message so the user can pick one. Returns the chosen path and a process
 // exit code (non-zero when there's nothing to pick or the user cancelled).
 func pickSessionToResume() (string, int) {
-	sessions, err := agent.ListSessions(resolveCLISessionDir())
-	if err != nil || len(sessions) == 0 {
+	sessionDir := resolveCLISessionDir()
+	reclaimCLIRecoveryBranches(sessionDir)
+	sessions := recentSessions(sessionDir)
+	if len(sessions) == 0 {
 		fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 		return "", 1
 	}
@@ -1498,20 +1559,12 @@ func pickSessionToResume() (string, int) {
 		fmt.Fprintln(os.Stderr, i18n.M.ResumeRequiresTTY)
 		return "", 1
 	}
-	const cap = 10
-	if len(sessions) > cap {
-		sessions = sessions[:cap]
-	}
 	items := make([]menuItem, len(sessions))
 	for i, s := range sessions {
 		when := s.ModTime.Local().Format("01-02 15:04")
-		preview := s.Preview
-		if preview == "" {
-			preview = "(no user message yet)"
-		}
 		items[i] = menuItem{
 			name: when,
-			desc: fmt.Sprintf("%d turns · %s", s.Turns, preview),
+			desc: sessionSummary(s),
 		}
 	}
 	idx, err := selectOne(i18n.M.PickSessionLabel, items)
@@ -2254,6 +2307,15 @@ func readStdin() string {
 
 func usage() {
 	fmt.Print(i18n.M.UsageBody)
+}
+
+type ctrlKillerAdapter struct{ ctrl *control.Controller }
+
+func (a ctrlKillerAdapter) Kill(sessionID, id string) bool {
+	if sessionID != "" && agent.BranchID(a.ctrl.SessionPath()) != sessionID {
+		return false
+	}
+	return a.ctrl.CancelJob(id)
 }
 
 func configCommand(args []string) int {

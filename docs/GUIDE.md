@@ -25,6 +25,7 @@
 - [Capability diagnostics](#capability-diagnostics)
 - [Plugins (MCP)](#plugins-mcp)
 - [Slash commands](#slash-commands)
+- [Embedded documentation retrieval](#embedded-documentation-retrieval)
 - [@ references](#-references)
 - [Two-model collaboration](#two-model-collaboration)
 
@@ -241,9 +242,21 @@ behind_proxy = true    # only behind a trusted reverse proxy
 
 The web UI exposes chat, tool approvals, session history, rewind/fork/summarize,
 model and reasoning-effort controls, Goal, a live todo panel fed by the
-`todo_write` tool, and provider balance when configured. Use `--model`,
+`todo_write` tool, extension status/card/form/notification surfaces, and
+provider balance when configured. Extension-hosted providers appear in the
+model picker. Run `/reload` while idle to fail-atomically reload extension
+sidecars and the runtime generation without restarting Serve. Use `--model`,
 `--max-steps`, or `--resume` for one-off launches; otherwise `serve` uses the
 user-global `default_model`.
+
+If the selected Provider has no saved API key, a loopback-bound Serve still
+starts and shows a Provider setup page instead of failing before the browser can
+connect. After authentication, enter the key there; Reasonix writes it to this
+host's global credential file with restricted permissions, rebuilds the active
+controller in the same process, and opens the normal UI. The credential-writing
+endpoint is disabled for non-loopback listeners. For a remote SSH window,
+"this host" means the remote host reached through the SSH tunnel; the key is
+not copied from the desktop machine.
 
 ## Editor integrations over ACP
 
@@ -324,7 +337,15 @@ files over SFTP, manage port forwards, and start/open the remote workspace.
 Opening a workspace creates a separate native Reasonix window, similar to a
 VS Code Remote SSH window. The primary window owns the SSH tunnel; the remote
 window is an isolated, lightweight shell and does not restore or acquire local
-conversation sessions.
+conversation sessions. The remote web page uses the provider configuration and
+API keys on the **remote** host — the desktop never exposes its own providers
+to a remote host. If that host is missing the selected Provider's API key, the
+window shows the authenticated setup page first, saves the key only in the
+remote Reasonix credential file, and activates the Provider without restarting
+the remote Serve process. A transient SSH outage keeps the remote window open;
+the desktop reconnects in the background, re-attaches its loopback forward, and
+reloads the window against the recovered Serve. An authentication or host-key
+failure is terminal and closes the unusable remote window instead.
 
 ## Custom OpenAI-compatible providers
 
@@ -969,16 +990,69 @@ Review the staged diff. Focus on $ARGUMENTS, list bugs with file:line.
 `$ARGUMENTS` expands to all space-separated args, `$1`…`$N` to positional ones.
 MCP prompts also appear here as `/mcp__<server>__<prompt>`.
 
+## Embedded documentation retrieval
+
+Reasonix bundles the Markdown files from `docs/` and the reviewed
+`release-notes/releases.json` catalog into each CLI and Desktop build. The
+read-only `docs` tool searches that exact offline corpus with local BM25
+retrieval and can read a complete matching section with source provenance. It
+renders every release in both languages under paths such as
+`changelog/v1.19.5.md` and `changelog/v1.19.5.zh-CN.md`, so questions about a
+specific version, upgrades, fixes, or known risks work offline. The agent should
+use the tool before web search or assumptions when a question concerns Reasonix
+configuration, CLI/Desktop behavior, release history, permissions, MCP, memory,
+recovery, providers, or maintainer workflows.
+
+No setup, network connection, vector database, or embedding service is needed.
+Search results prefer the query language while retaining explicit `en`,
+`zh-CN`, audience, and catalog filters. Balanced and Delivery profiles expose the
+tool directly; Economy connects the `docs` source on demand. Every result reports
+the product version, immutable source revision, and corpus SHA-256 digest. Release
+CI compiles the CLI and rejects publication unless that embedded manifest matches
+the candidate's `docs/*.md`, `release-notes/releases.json`, and build identity. A
+newer online `main-v2` page therefore cannot silently replace version-matched
+local guidance or release history.
+
+Use `/docs` to inspect the bundled corpus identity and usage examples without
+calling a model. Use `/docs <question>` (for example,
+`/docs 1.19.5 changelog`) to make Reasonix search the corpus locally first and
+then pass the version-matched evidence to the currently configured AI for a
+sourced answer. This command path does not depend on the model deciding to call
+the `docs` tool, while ordinary natural-language questions may still use the
+tool automatically. Existing custom commands and compatible plugin or skill
+aliases keep ownership of `/docs`; when that happens, CLI and Desktop normally
+expose the built-in corpus as `/reasonix:docs` instead. If that qualified name is
+also already owned, Reasonix selects the next free `reasonix:`-qualified fallback
+without displacing it. A remote Desktop uses the host's resolved command catalog,
+so the displayed entry always matches what that host will execute.
+
+Pull requests that change user-visible CLI, Desktop, configuration, provider,
+permission, or tool behavior must declare whether embedded documentation was
+updated. When no documentation change is needed, the declaration must explain
+why the existing version-matched guidance remains correct.
+
 ## Goal and AutoResearch
 
 Goal is the unified runtime for long-running objectives. Ordinary `/goal`
 objectives stay lightweight: Reasonix keeps working until the goal is complete,
-blocked, or cleared. When a goal is clearly long-horizon, Goal automatically
-enables the AutoResearch strategy instead of requiring a separate
+blocked, paused, or cleared. When a goal is clearly long-horizon, Goal
+automatically enables the AutoResearch strategy instead of requiring a separate
 `/auto-research` skill; `auto-research` is not listed as a standalone built-in
 skill in Settings -> Skills or the slash menu. Ordinary chat never changes the
 collaboration mode implicitly; choose Goal in the composer or use `/goal` to
 start a long-running objective.
+
+Goal runs under a per-class budget: simple goals get 10 turns / 200k tokens,
+write goals 20 turns / 400k tokens, and AutoResearch goals 40 turns / 800k
+tokens; four consecutive turns without host-verifiable progress pause the goal.
+A paused goal keeps its todos, Delivery checkpoint, and budget history — use
+`/goal resume` to continue (budget pauses add one more slice of the same
+class), or `/goal pause` to pause a running goal manually. `/goal status`
+shows the full runtime summary. At the end of every goal turn the model reports
+its disposition through the structured `update_goal` tool (continue/complete/
+blocked); when no report arrives, an independent bounded evaluator judges the
+turn once, and any evaluator failure pauses the goal instead of continuing
+silently.
 
 For complex work, write the objective as a
 [task contract](./TASK_CONTRACT.md): Context, Request, Output format,
@@ -1136,6 +1210,14 @@ the strict read-only entrances:
 | `reasonix review` (CLI) | Read-only review of a diff or branch |
 | Desktop preview/review subagents | Read-only desktop analysis surfaces |
 
+In persisted sessions, `parallel_tasks` and `fleet` return a bounded preview
+plus one `Subagent reference` per completed child instead of concatenating every
+full answer into a truncation-prone tool result. The parent can call
+`read_subagent_result` with that reference and page by `offset_bytes`; results
+are scoped to the current conversation lineage and workspace. Headless runs
+without a persisted parent session remain ephemeral and receive fair bounded
+previews, but cannot mint durable references.
+
 The interactive two-model Planner uses a dedicated construction path
 (`NewPlannerAgent`): it still blocks bash, file writers, and ordinary writers,
 but may call authorized, non-destructive MCP through the fixed
@@ -1180,10 +1262,10 @@ Choose the startup runtime profile with
 `--profile economy|balanced|delivery` (for example, `reasonix run --profile
 delivery "fix and verify this bug"`). Economy starts with nine tools: direct
 read/bash/edit/write, background-shell lifecycle controls, `ask`, and
-`connect_tool_source`. Dedicated search/file/workflow tools, session history,
-memory mutation, slash commands, Skills, MCP, LSP, web access, installation, and
-subagents are connected only when the task needs them. Balanced is the default
-with the complete tool surface; when a distinct Planner is configured, both
+`connect_tool_source`. Embedded docs, dedicated search/file/workflow tools,
+session history, memory mutation, slash commands, Skills, MCP, LSP, web access,
+installation, and subagents are connected only when the task needs them.
+Balanced is the default with the complete tool surface; when a distinct Planner is configured, both
 Planner and Executor add the fixed `use_capability` proxy. The proxy schema is
 stable, but the Balanced Executor deliberately retains direct `mcp__*` tools,
 so its overall provider tool prefix may still change when those direct tools

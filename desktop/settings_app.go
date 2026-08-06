@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -62,6 +63,7 @@ type ProviderView struct {
 	ContextWindow     int                         `json:"contextWindow"`
 	ReasoningProtocol string                      `json:"reasoningProtocol"`
 	Thinking          string                      `json:"thinking"`
+	WebSearch         bool                        `json:"webSearch"`
 	SupportedEfforts  []string                    `json:"supportedEfforts"`
 	DefaultEffort     string                      `json:"defaultEffort"`
 	ModelOverrides    []ProviderModelOverrideView `json:"modelOverrides"`
@@ -160,7 +162,6 @@ type AgentView struct {
 	CompactRatio           float64 `json:"compactRatio,omitempty"`
 	EffectiveCompactRatio  float64 `json:"effectiveCompactRatio,omitempty"`
 	CompactRatioOverridden bool    `json:"compactRatioOverridden,omitempty"`
-	CompactRatioRemote     bool    `json:"compactRatioRemote,omitempty"`
 }
 
 type BotAllowlistView struct {
@@ -308,6 +309,10 @@ type SettingsView struct {
 	ExpandThinking    bool   `json:"expandThinking"`
 	ConversationWidth string `json:"conversationWidth,omitempty"`
 	ConfigPath        string `json:"configPath"`
+	// ShadowedByPath is the workspace reasonix.toml that outranks the file this
+	// panel writes, so an edit here can be overridden with nothing on screen to
+	// explain it (#4333). Empty when the panel's file is the one in effect.
+	ShadowedByPath string `json:"shadowedByPath,omitempty"`
 	// ProviderKinds lists the provider implementations the kernel actually
 	// registered (provider.Kinds()), so the editor's "kind" picker offers only
 	// kinds that resolve — selecting an unregistered one would fail the rebuild.
@@ -340,6 +345,33 @@ type DesktopStartupSettingsView struct {
 	// recovered in memory (last-known-good or defaults) without rewriting files.
 	ConfigWarnings []string `json:"configWarnings,omitempty"`
 	ConfigPath     string   `json:"configPath,omitempty"`
+}
+
+// shadowingConfigPath returns the config file that outranks writePath for the
+// workspace at root, or "" when writePath is the one in effect. A project
+// reasonix.toml beats the user config, so settings written here would otherwise
+// look ignored (#4333).
+func shadowingConfigPath(writePath, root string) string {
+	effective := config.SourcePathForRoot(root)
+	if effective == "" || samePath(effective, writePath) {
+		return ""
+	}
+	if abs, err := filepath.Abs(effective); err == nil {
+		return abs
+	}
+	return effective
+}
+
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(absA), filepath.Clean(absB))
+	}
+	return filepath.Clean(absA) == filepath.Clean(absB)
 }
 
 func nonNil(s []string) []string {
@@ -620,6 +652,7 @@ func providerViewFromEntryForRootWithResolverAndCredentials(p config.ProviderEnt
 		ContextWindow:           p.ContextWindow,
 		ReasoningProtocol:       p.ReasoningProtocol,
 		Thinking:                providerThinkingForSettings(p.Thinking),
+		WebSearch:               config.EffectiveWebSearch(&p),
 		SupportedEfforts:        nonNil(p.SupportedEfforts),
 		DefaultEffort:           p.DefaultEffort,
 		ModelOverrides:          providerModelOverridesForView(p.ModelOverrides, models),
@@ -1063,6 +1096,7 @@ func (a *App) Settings() SettingsView {
 		ExpandThinking:          cfg.Desktop.ExpandThinking,
 		ConversationWidth:       cfg.DesktopConversationWidth(),
 		ConfigPath:              cfgPath,
+		ShadowedByPath:          shadowingConfigPath(cfgPath, root),
 		ProviderKinds:           nonNil(provider.Kinds()),
 		AutoApproveTools:        ctrl != nil && ctrl.AutoApproveTools(),
 		Bypass:                  ctrl != nil && ctrl.AutoApproveTools(),
@@ -1073,7 +1107,6 @@ func (a *App) Settings() SettingsView {
 			v.Agent.CompactRatioOverridden = math.Abs(effective-v.Agent.CompactRatio) > 0.0001
 		}
 	}
-	v.Agent.CompactRatioRemote = a.activeWorkbenchTargetIsRemote()
 	added := providerAccessSet(cfg.Desktop.ProviderAccess)
 	resolver := config.NewCredentialResolverForRoot(root)
 	credentialsRevision := providerCredentialsRevision()
@@ -1724,7 +1757,6 @@ func (a *App) rebuildSetting(setting string) error {
 	a.runtimeRebuildMu.Lock()
 	err := a.rebuildSettingLocked(setting)
 	a.runtimeRebuildMu.Unlock()
-	a.refreshWorkbenchProviderBrokerAsync()
 	return err
 }
 
@@ -1741,13 +1773,17 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	}
 	tab.turnStartMu.Lock()
 	defer tab.turnStartMu.Unlock()
-	return a.rebuildSettingTurnLocked(setting, tab, false)
+	return a.rebuildSettingTurnLocked(setting, tab, false, false)
 }
 
 // rebuildSettingTurnLocked is rebuildSettingLocked's body; callers must hold
 // runtimeRebuildMu and the passed tab's turnStartMu. admissionHeld is true for
 // MCP lifecycle callers that also hold runtimeAdmissionMu's write side.
-func (a *App) rebuildSettingTurnLocked(setting string, tab *WorkspaceTab, admissionHeld bool) error {
+// reload selects the stage-3b runtime-reload build path (boot.Rebuild migrates
+// the session) instead of the legacy boot.Build + manual migration; everything
+// else — active-work guards, workspace prep, lease moves, swap, close-after-
+// swap, fence — is shared.
+func (a *App) rebuildSettingTurnLocked(setting string, tab *WorkspaceTab, admissionHeld bool, reload bool) error {
 	if a.ctx == nil {
 		return nil
 	}
@@ -1804,21 +1840,7 @@ func (a *App) rebuildSettingTurnLocked(setting string, tab *WorkspaceTab, admiss
 			model = resolved
 		}
 	}
-	sharedHost := a.lookupSharedHost(snap.sharedHostKey)
-	ctrl, err := boot.Build(a.bootContext(), boot.Options{
-		Model: model, RequireKey: false,
-		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
-		StatsSource:              "desktop",
-		Sink:                     snap.sink,
-		WorkspaceRoot:            snap.workspaceRoot,
-		SessionDir:               sessionDirForSnapshot(snap),
-		EffortOverride:           cloneStringPtr(snap.effort),
-		TokenMode:                runtime.tokenMode,
-		SharedHost:               sharedHost,
-		CleanupPendingReconciler: reconcileDesktopCleanupPending,
-		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
-		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
-	})
+	ctrl, restoredRuntime, path, err := a.buildSettingReplacementController(tab, snap, runtime, model, prevPath, setting, oldCtrl, carried, reload)
 	if err != nil {
 		if oldCtrl == nil {
 			leaseHeld := false
@@ -1836,18 +1858,6 @@ func (a *App) rebuildSettingTurnLocked(setting string, tab *WorkspaceTab, admiss
 			}
 			a.emitReady(a.ctx)
 		}
-		return err
-	}
-	a.bindControllerDisplayRecorder(ctrl)
-	configureControllerRuntime(ctrl, oldCtrl, runtime)
-	path := agent.ContinueSessionPath(prevPath, ctrl.SessionDir(), ctrl.Label())
-	if err := a.ensureTabSessionLeaseForRebuild(tab, path, setting); err != nil {
-		ctrl.Close()
-		return err
-	}
-	restoredRuntime, err := resumeControllerRuntimeWithMessages(ctrl, carried, path, runtime)
-	if err != nil {
-		ctrl.Close()
 		return err
 	}
 	a.mu.Lock()
@@ -1879,6 +1889,134 @@ func (a *App) rebuildSettingTurnLocked(setting string, tab *WorkspaceTab, admiss
 	a.notifyTabRuntimeRebuilt(tab)
 	a.emitReady(a.ctx)
 	return nil
+}
+
+// buildSettingReplacementController builds the replacement controller for
+// rebuildSettingTurnLocked and migrates the session onto it, returning the
+// controller, the runtime posture actually restored, and the session path it
+// bound. reload=false is the legacy settings path (boot.Build plus the
+// desktop's manual migration); reload=true is the stage-3b runtime reload,
+// routing build and migration through boot.Rebuild so history, approval mode
+// and grants, plan/goal state, and lifecycle move inside the boot layer. The
+// caller owns the swap, closing the old controller after the swap, and the
+// post-swap persistence.
+func (a *App) buildSettingReplacementController(tab *WorkspaceTab, snap tabRuntimeSnapshot, runtime normalizedTabRuntime, model, prevPath, setting string, oldCtrl control.SessionAPI, carried []provider.Message, reload bool) (control.SessionAPI, normalizedTabRuntime, string, error) {
+	opts := boot.Options{
+		Model: model, RequireKey: false,
+		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
+		StatsSource:              "desktop",
+		Sink:                     snap.sink,
+		WorkspaceRoot:            snap.workspaceRoot,
+		SessionDir:               sessionDirForSnapshot(snap),
+		EffortOverride:           cloneStringPtr(snap.effort),
+		TokenMode:                runtime.tokenMode,
+		SharedHost:               a.lookupSharedHost(snap.sharedHostKey),
+		CleanupPendingReconciler: reconcileDesktopCleanupPending,
+		SubagentParentLive:       a.subagentParentProbeForBuild(tab),
+		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
+	}
+	if reload && oldCtrl != nil {
+		old, ok := oldCtrl.(*control.Controller)
+		if !ok {
+			return nil, normalizedTabRuntime{}, "", fmt.Errorf("reload runtime: controller is %T, want *control.Controller", oldCtrl)
+		}
+		res, err := boot.Rebuild(a.bootContext(), old, opts)
+		if err != nil {
+			return nil, normalizedTabRuntime{}, "", err
+		}
+		// The stage-3a runtime set is always empty; when stage 5 binds
+		// sidecar processes it must retire with the controller it belongs to.
+		ctrl := res.Controller
+		a.bindControllerDisplayRecorder(ctrl)
+		// boot.Rebuild migrated history (same session file, fresh system
+		// prompt spliced), approval mode and grants, plan/goal state, and
+		// lifecycle. The interactive approval gate and the plan/yolo tab
+		// mode are desktop wiring Rebuild deliberately leaves out — the
+		// mode re-apply also restores yolo, which Rebuild does not carry.
+		ctrl.EnableInteractiveApproval()
+		applyTabModeToController(ctrl, runtime.tabMode())
+		// Same path Rebuild pinned internally (identical inputs), recomputed
+		// for the lease move and the post-swap persistence.
+		path := agent.ContinueSessionPath(prevPath, ctrl.SessionDir(), ctrl.Label())
+		if err := a.ensureTabSessionLeaseForRebuild(tab, path, setting); err != nil {
+			ctrl.Close()
+			return nil, normalizedTabRuntime{}, "", err
+		}
+		restoredRuntime, err := normalizeRestoredControllerRuntime(ctrl, runtime)
+		if err != nil {
+			ctrl.Close()
+			return nil, normalizedTabRuntime{}, "", err
+		}
+		return ctrl, restoredRuntime, path, nil
+	}
+	ctrl, err := boot.Build(a.bootContext(), opts)
+	if err != nil {
+		return nil, normalizedTabRuntime{}, "", err
+	}
+	a.bindControllerDisplayRecorder(ctrl)
+	configureControllerRuntime(ctrl, oldCtrl, runtime)
+	path := agent.ContinueSessionPath(prevPath, ctrl.SessionDir(), ctrl.Label())
+	if err := a.ensureTabSessionLeaseForRebuild(tab, path, setting); err != nil {
+		ctrl.Close()
+		return nil, normalizedTabRuntime{}, "", err
+	}
+	restoredRuntime, err := resumeControllerRuntimeWithMessages(ctrl, carried, path, runtime)
+	if err != nil {
+		ctrl.Close()
+		return nil, normalizedTabRuntime{}, "", err
+	}
+	return ctrl, restoredRuntime, path, nil
+}
+
+// runtimeReloadSettingLabel is the settings-style label used in busy/lease
+// error text and notices for an explicit runtime reload.
+const runtimeReloadSettingLabel = "runtime reload"
+
+// ReloadRuntime rebuilds the tab's agent runtime in place — tools, skills,
+// commands, hooks, providers, and MCP servers are re-discovered from the
+// current config — while the session carries over (transcript, approval
+// grants, goal/recovery state, shared plugin Host) via boot.Rebuild. Active
+// work or a held lease queues exactly one reload on the deferred-rebuild
+// loop, which runs it once the tab is idle; a failure keeps the old
+// controller fully usable.
+func (a *App) ReloadRuntime(tabID string) error {
+	if a.ctx == nil {
+		return nil
+	}
+	tab := a.tabByID(tabID)
+	if tab == nil || tab.ID != tabID {
+		return fmt.Errorf("unknown tab %q", tabID)
+	}
+	// Same serialization as rebuildSetting: two build+swap sequences on the
+	// same tab must not interleave.
+	a.runtimeRebuildMu.Lock()
+	err := a.reloadRuntimeTurnLocked(tab)
+	a.runtimeRebuildMu.Unlock()
+	if err == nil {
+		return nil
+	}
+	var busy *rebuildBusyError
+	if errors.As(err, &busy) || errors.Is(err, agent.ErrSessionLeaseHeld) {
+		// Queue exactly one reload per tab (the pending map coalesces
+		// duplicates); the loop retries once the work finishes or the lease
+		// clears.
+		a.scheduleDeferredRebuild(tab.ID, deferredRuntimeReloadLabel)
+		a.noticeForTab(tab.ID, "runtime reload queued: will run when the current work finishes")
+		return nil
+	}
+	return err
+}
+
+// reloadRuntimeTurnLocked runs the in-place runtime reload for tab; callers
+// hold runtimeRebuildMu (the deferred-rebuild retry loop also drives it).
+func (a *App) reloadRuntimeTurnLocked(tab *WorkspaceTab) error {
+	if a.ctx == nil {
+		return nil
+	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
+	return a.rebuildSettingTurnLocked(runtimeReloadSettingLabel, tab, false, true)
 }
 
 // SetDefaultModel sets the config default and switches the live model to it.
@@ -2234,6 +2372,12 @@ func saveProviderConfig(c *config.Config, p ProviderView) error {
 	e.ContextWindow = p.ContextWindow
 	e.ReasoningProtocol = p.ReasoningProtocol
 	e.Thinking = providerThinkingForSettings(p.Thinking)
+	if config.SupportsServerWebSearch(&e) {
+		enabled := p.WebSearch
+		e.WebSearch = &enabled
+	} else {
+		e.WebSearch = nil
+	}
 	e.SupportedEfforts = p.SupportedEfforts
 	e.DefaultEffort = p.DefaultEffort
 	e.Model = ""
@@ -2660,11 +2804,7 @@ func (a *App) FetchAllProviderModels(providers []ProviderView) map[string][]stri
 
 // DeleteProvider removes a provider and retargets open idle tabs that used it.
 func (a *App) DeleteProvider(name string) error {
-	err := a.deleteProviderAndRetargetTabs(name)
-	if err == nil {
-		a.refreshWorkbenchProviderBrokerAsync()
-	}
-	return err
+	return a.deleteProviderAndRetargetTabs(name)
 }
 
 // RemoveProviderAccess hides a provider from Settings > Model > Access and from
@@ -2672,12 +2812,7 @@ func (a *App) DeleteProvider(name string) error {
 // for back-compat, but visible defaults and idle tabs are retargeted away from
 // the removed access entry when another accessed provider is available. Custom
 // providers are deleted outright.
-func (a *App) RemoveProviderAccess(name string) (err error) {
-	defer func() {
-		if err == nil {
-			a.refreshWorkbenchProviderBrokerAsync()
-		}
-	}()
+func (a *App) RemoveProviderAccess(name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return fmt.Errorf("remove provider access: empty provider name")
@@ -3017,7 +3152,7 @@ func (a *App) rebuildActiveSettingRuntimeMutationLocked(setting string) error {
 		}
 		return fmt.Errorf("no active tab")
 	}
-	return a.rebuildSettingTurnLocked(setting, tab, true)
+	return a.rebuildSettingTurnLocked(setting, tab, true, false)
 }
 
 // SetProviderKey writes a secret to Reasonix's global .env under the given

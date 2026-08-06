@@ -507,6 +507,22 @@ ok(
 );
 
 ok(
+  /const creationEmptyHero =/.test(appSource) &&
+    /!sidebarImDetailConnection/.test(appSource) &&
+    /!transcriptHydrating/.test(appSource) &&
+    /!hydratePlaceholderActive/.test(appSource) &&
+    /chat-pane\$\{creationEmptyHero \? " chat-pane--creation-empty" : ""\}/.test(appSource) &&
+    /heroMode=\{creationEmptyHero\}/.test(appSource),
+  "Creation empty hero waits for hydration and skips IM/Bot detail panels",
+);
+
+ok(
+  /if \(heroMode\) \{[\s\S]*?const maxHeight = 96;[\s\S]*?setTextareaAutoHeight/.test(composerSource) &&
+    !/if \(heroMode\) \{\s*setTextareaAutoHeight\(20\);/.test(composerSource),
+  "Creation hero composer auto-grows multi-line drafts instead of clipping at 20px",
+);
+
+ok(
   /const \[workspaceControllerEpoch, setWorkspaceControllerEpoch\] = useState\(0\);/.test(appSource) &&
     /const workspaceScopeKey = \[/.test(appSource) &&
     /activeTab\?\.sessionPath/.test(appSource) &&
@@ -778,6 +794,18 @@ ok(
   finalDeclaration(".skip-to-composer", "box-shadow") === "none" &&
     finalDeclaration(".skip-to-composer:focus-visible", "box-shadow")?.includes("0 12px 28px"),
   "offscreen skip link does not leak its focus shadow into the workbench title area",
+);
+
+// The Wails drag runtime drops any mousedown with detail !== 1, so a double
+// click on a drag region never reaches the OS: both title-bar-hiding platforms
+// have to zoom from here or not at all.
+ok(
+  /chromeDoubleClickZooms\s*=\s*windowsFramelessChrome\s*\|\|\s*desktopPlatform === "darwin"/.test(appSource),
+  "title-bar double click zooms on macOS as well as frameless Windows",
+);
+ok(
+  /handleChromeTitlebarDoubleClick[\s\S]{0,400}?closest\("button, input, textarea, select, a, \[role='button'\], \[role='tab'\], \.windows-window-controls"\)/.test(appSource),
+  "title-bar double click still ignores interactive controls",
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);
