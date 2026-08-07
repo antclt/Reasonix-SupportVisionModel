@@ -11,16 +11,13 @@
 package control
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -51,10 +48,11 @@ import (
 	"reasonix/internal/nilutil"
 	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
-	"reasonix/internal/proc"
 	"reasonix/internal/provider"
 	"reasonix/internal/recovery"
 	"reasonix/internal/sandbox"
+	"reasonix/internal/sessiontemp"
+	"reasonix/internal/shellrun"
 	"reasonix/internal/skill"
 	"reasonix/internal/store"
 	"reasonix/internal/taskmonitor"
@@ -96,7 +94,7 @@ type Controller struct {
 	// pauses instead of defaulting to continue.
 	evaluator goaleval.Evaluator
 	// goalUsageTee accounts billable usage events into the active goal turn's
-	// token budget. It wraps the public sink when the caller didn't provide one.
+	// observational token total. It wraps the public sink when the caller didn't provide one.
 	goalUsageTee *goalUsageTee
 	sink         event.Sink
 	policy       permission.Policy
@@ -276,6 +274,10 @@ type Controller struct {
 	autosaveWG  sync.WaitGroup
 	planMode    bool
 	sessionPath string
+	// sessionTemp owns the logical-session private temporary directory shared
+	// by Bash calls. Retained for this Controller's lifetime; rotated on
+	// /new, /clear, resume of another session, and branch switches.
+	sessionTemp *sessiontemp.Manager
 	// recoveryDepthCapNotices records session paths that already surfaced the
 	// depth-cap recovery warning. Repeated saves on the same conflict copy are
 	// diagnostic noise for the UI; keep logging/diagnostics, but emit the user
@@ -534,6 +536,11 @@ type Options struct {
 	// Ablation switches subsystems off for a benchmark arm. The zero value runs
 	// everything.
 	Ablation ablation.Set
+	// SessionTemp is the logical-session private temporary directory manager
+	// shared by sandboxed Bash calls. Nil creates a fresh Manager owned by this
+	// Controller. Hot rebuilds pass the previous Controller's Manager so the
+	// temporary directory survives model/settings swaps.
+	SessionTemp *sessiontemp.Manager
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard. When the
@@ -610,6 +617,16 @@ func New(opts Options) *Controller {
 		providerResolver:                  opts.ProviderResolver,
 		approval:                          newApprovalManager(opts.Policy, ToolApprovalAsk, opts.ApprovalTimeout),
 	}
+	// Session-private temporary directory: reuse a shared Manager on hot
+	// rebuild, otherwise create one. Retain so ReleaseResources/Close drop the
+	// owner reference without racing a replacement Controller.
+	if opts.SessionTemp != nil {
+		c.sessionTemp = opts.SessionTemp
+	} else {
+		c.sessionTemp = sessiontemp.New()
+	}
+	c.sessionTemp.Retain()
+
 	if strings.TrimSpace(opts.WorkspaceRoot) != "" {
 		c.autoResearch = autoresearch.NewStore(opts.WorkspaceRoot)
 	}
@@ -789,10 +806,12 @@ func (c *Controller) markEditedForNewUser(startMessages int, original string) {
 		msgs[i].Edited = true
 		msgs[i].Original = original
 		// A periodic autosave may already contain this user message without its
-		// local edit metadata. Classify the prefix mutation atomically so the
-		// turn-end save performs an owned rewrite instead of forking a bogus
-		// same-revision recovery branch.
-		s.Rewrite(msgs)
+		// local edit metadata. Classify the mutation atomically so the turn-end
+		// save performs an owned rewrite instead of forking a bogus
+		// same-revision recovery branch. Edited/Original are local-only display
+		// metadata (provider requests ignore them), so this must not report a
+		// cache-prefix change — ReplaceLocalMetadata, not Rewrite.
+		s.ReplaceLocalMetadata(msgs)
 		return
 	}
 }
@@ -1596,7 +1615,7 @@ func (c *Controller) applyGoalCommand(input, display string) bool {
 		rt := c.GoalRuntime()
 		c.notice(fmt.Sprintf(i18n.M.GoalCurrentFmt, goal))
 		c.notice(fmt.Sprintf(i18n.M.GoalRuntimeFmt,
-			rt.TurnsUsed, rt.TurnsLimit, rt.TokensUsed, rt.TokensLimit,
+			rt.TurnsUsed, rt.TurnsLimit, rt.TokensUsed,
 			rt.NoProgressTurns, rt.NoProgressLimit, rt.BudgetExtensions))
 		if rt.LastReason != "" {
 			c.noticeDetail(i18n.M.GoalRuntimeLastReason, rt.LastReason)
@@ -1726,15 +1745,6 @@ const shellTimeout = 120 * time.Second
 // the child's pipes to drain, matching the bash tool's WaitDelay.
 const shellWaitDelay = 5 * time.Second
 
-// shellWriter forwards each chunk of shell output to a callback, so RunShell
-// can stream live progress to the frontend as the command produces output.
-type shellWriter struct{ emit func(string) }
-
-func (w *shellWriter) Write(p []byte) (int, error) {
-	w.emit(string(p))
-	return len(p), nil
-}
-
 func shellCommandPreview(command string) string {
 	command = strings.TrimSpace(strings.ReplaceAll(command, "\n", " "))
 	const max = 48
@@ -1769,6 +1779,7 @@ func (c *Controller) RunShell(command string) {
 		}
 		id := "shell-" + string(preview)
 		diagnosticPreview := shellCommandPreview(command)
+		desc := shellrun.DescriptorFromShell(sh)
 
 		c.sink.Emit(event.Event{
 			Kind: event.ToolDispatch,
@@ -1776,60 +1787,77 @@ func (c *Controller) RunShell(command string) {
 				ID:   id,
 				Name: "bash",
 				Args: fmt.Sprintf(`{"command":%q}`, command),
+				Execution: &event.ShellExecution{
+					Kind: desc.Kind, Shell: desc.Shell, ShellVersion: desc.ShellVersion,
+					Platform: desc.Platform, SupportsAndAnd: desc.SupportsAndAnd,
+					State: tool.ShellStateRunning,
+				},
 			},
 		})
 
-		ctx, cancel := context.WithTimeout(ctx, shellTimeout)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-		cmd.WaitDelay = shellWaitDelay
-		cmd.Dir = c.workspaceRoot
-		var buf bytes.Buffer
-		w := io.MultiWriter(&buf, &shellWriter{emit: func(chunk string) {
-			c.sink.Emit(event.Event{
-				Kind: event.ToolProgress,
-				Tool: event.Tool{ID: id, Output: chunk},
-			})
-		}})
-		cmd.Stdout = w
-		cmd.Stderr = w
 		start := time.Now()
-		_, err := proc.RunCommand(ctx, cmd, proc.RunOptions{
-			Track:           true,
-			CancelWaitGrace: shellWaitDelay + time.Second,
-			Source:          "user_shell",
-			ShellKind:       sh.Kind.String(),
-			ShellPath:       sh.Path,
-			CommandPreview:  diagnosticPreview,
+		res := shellrun.RunForeground(ctx, shellrun.Request{
+			Argv:           argv,
+			Dir:            c.workspaceRoot,
+			Timeout:        shellTimeout,
+			WaitDelay:      shellWaitDelay,
+			CommandPreview: diagnosticPreview,
+			ShellKind:      sh.Kind.String(),
+			ShellPath:      sh.Path,
+			Source:         "user_shell",
+			Track:          true,
+			Progress: func(chunk string) {
+				c.sink.Emit(event.Event{
+					Kind: event.ToolProgress,
+					Tool: event.Tool{ID: id, Output: chunk},
+				})
+			},
 		})
 		durationMs := time.Since(start).Milliseconds()
-		out := buf.String()
+		ex := &event.ShellExecution{
+			Kind: desc.Kind, Shell: desc.Shell, ShellVersion: desc.ShellVersion,
+			Platform: desc.Platform, SupportsAndAnd: desc.SupportsAndAnd,
+			State: res.State, FailurePhase: res.FailurePhase,
+			OutputTail: res.OutputTail, DurationMs: durationMs,
+			MutationRisk: tool.ShellMutationNone,
+			Verification: tool.ShellVerificationNotVerification,
+		}
+		if res.ExitCode != nil {
+			code := *res.ExitCode
+			ex.ExitCode = &code
+		}
+		switch res.State {
+		case tool.ShellStateCompleted:
+			ex.MutationRisk = tool.ShellMutationNone
+		case tool.ShellStateNotRun:
+			ex.MutationRisk = tool.ShellMutationNotStarted
+		case tool.ShellStateFailed:
+			if res.FailurePhase == tool.ShellPhaseLaunch {
+				ex.MutationRisk = tool.ShellMutationNotStarted
+			} else {
+				ex.MutationRisk = tool.ShellMutationMayBePartial
+			}
+		case tool.ShellStateTimedOut, tool.ShellStateCancelled:
+			ex.MutationRisk = tool.ShellMutationMayBePartial
+		}
 
-		if ctx.Err() == context.Canceled {
-			c.sink.Emit(event.Event{
-				Kind: event.ToolResult,
-				Tool: event.Tool{ID: id, Name: "bash", Output: out, Err: i18n.M.TurnCancelled, DurationMs: durationMs},
-			})
-			return nil
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			c.sink.Emit(event.Event{
-				Kind: event.ToolResult,
-				Tool: event.Tool{ID: id, Name: "bash", Output: out, Err: fmt.Sprintf(i18n.M.ShellExecTimeoutFmt, shellTimeout), DurationMs: durationMs},
-			})
-			return nil
-		}
-		if err != nil {
-			c.sink.Emit(event.Event{
-				Kind: event.ToolResult,
-				Tool: event.Tool{ID: id, Name: "bash", Output: out, Err: fmt.Sprintf(i18n.M.ShellExecFailedFmt, err), DurationMs: durationMs},
-			})
-			return nil
+		errText := ""
+		switch res.State {
+		case tool.ShellStateCancelled:
+			errText = i18n.M.TurnCancelled
+		case tool.ShellStateTimedOut:
+			errText = fmt.Sprintf(i18n.M.ShellExecTimeoutFmt, shellTimeout)
+		case tool.ShellStateFailed, tool.ShellStateNotRun:
+			if res.Err != nil {
+				errText = fmt.Sprintf(i18n.M.ShellExecFailedFmt, res.Err)
+			}
 		}
 		c.sink.Emit(event.Event{
 			Kind: event.ToolResult,
-			Tool: event.Tool{ID: id, Name: "bash", Output: out, DurationMs: durationMs},
+			Tool: event.Tool{
+				ID: id, Name: "bash", Output: res.Combined, Err: errText,
+				DurationMs: durationMs, Execution: ex,
+			},
 		})
 		return nil
 	})
@@ -2490,8 +2518,10 @@ func (c *Controller) Ask(ctx context.Context, questions []event.AskQuestion) ([]
 	c.approval.promptMu.Lock()
 	defer c.approval.promptMu.Unlock()
 
+	c.approval.promptEmitMu.Lock()
 	id, reply := c.approval.registerAsk(questions)
 	c.sink.Emit(event.Event{Kind: event.AskRequest, Ask: event.Ask{ID: id, Questions: questions}})
+	c.approval.promptEmitMu.Unlock()
 
 	waitCtx, cancelWait := c.approval.waitContext(ctx)
 	defer cancelWait()
@@ -2582,16 +2612,52 @@ func askAnswersHaveSelection(answers []event.AskAnswer) bool {
 // requestApproval, so in practice at most one prompt is outstanding; the loops
 // stay general so a future concurrent prompt would still replay correctly.
 func (c *Controller) ReplayPendingPrompts() {
+	c.approval.promptEmitMu.Lock()
+	noApprovals := c.replayPendingPromptsTo(c.sink)
+	c.approval.promptEmitMu.Unlock()
+	if noApprovals {
+		// Retained compatibility hook; live Auto Guard cards are ordinary approvals.
+		c.ReplayUnresolvedRecoveries()
+	}
+}
+
+// ReplayPendingPromptsTo re-emits pending prompts to one frontend sink. Serve
+// uses this for a newly attached SSE client so existing browsers do not receive
+// duplicate approval/ask cards when another client reconnects.
+func (c *Controller) ReplayPendingPromptsTo(sink event.Sink) {
+	c.approval.promptEmitMu.Lock()
+	defer c.approval.promptEmitMu.Unlock()
+	c.replayPendingPromptsTo(sink)
+}
+
+// ReplayPendingPromptsWith performs an SSE connection handoff while prompt
+// registration and emission are paused. The factory must subscribe the new
+// client and return a sink that targets it; this closes the attach race where
+// the original prompt could otherwise land between Subscribe and replay.
+func (c *Controller) ReplayPendingPromptsWith(sinkFactory func() event.Sink) {
+	if sinkFactory == nil {
+		return
+	}
+	c.approval.promptEmitMu.Lock()
+	defer c.approval.promptEmitMu.Unlock()
+	c.replayPendingPromptsTo(sinkFactory())
+}
+
+func (c *Controller) replayPendingPromptsTo(sink event.Sink) bool {
 	approvals, asks := c.approval.snapshotPrompts()
+	c.emitPendingPrompts(sink, approvals, asks)
+	return len(approvals) == 0
+}
+
+func (c *Controller) emitPendingPrompts(sink event.Sink, approvals []event.Approval, asks []event.Ask) {
+	if sink == nil {
+		return
+	}
 	for _, a := range approvals {
-		c.sink.Emit(c.approvalRequestEvent(a))
+		sink.Emit(c.approvalRequestEvent(a))
 	}
 	for _, a := range asks {
-		c.sink.Emit(event.Event{Kind: event.AskRequest, Ask: a})
-	}
-	// Retained compatibility hook; live Auto Guard cards are ordinary approvals.
-	if len(approvals) == 0 {
-		c.ReplayUnresolvedRecoveries()
+		sink.Emit(event.Event{Kind: event.AskRequest, Ask: a})
 	}
 }
 
@@ -3224,6 +3290,7 @@ func (c *Controller) NewSession() error {
 	freshPath := c.SessionPath()
 	c.rebindCheckpoints(freshPath)
 	c.resetRecoveryForNewSession(freshPath)
+	c.rotateSessionTemp()
 	c.snapshotMu.Unlock()
 	// A new session starts with no active goal: without this, a running goal's
 	// text kept injecting into the fresh session's first turns. The old
@@ -3307,6 +3374,7 @@ func (c *Controller) ClearSession() error {
 	freshPath := c.SessionPath()
 	c.rebindCheckpoints(freshPath)
 	c.resetRecoveryForNewSession(freshPath)
+	c.rotateSessionTemp()
 	c.snapshotMu.Unlock()
 	// Same contract as NewSession: the fresh session starts with no active goal.
 	c.ClearGoal()
@@ -3527,6 +3595,8 @@ func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string
 		if c.guardianSess != nil {
 			c.guardianSess.Reset()
 		}
+		// Switching into the fork is a new logical session for temporary files.
+		c.rotateSessionTemp()
 		c.snapshotMu.Unlock()
 	}
 	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
@@ -3607,6 +3677,7 @@ func (c *Controller) Branch(name string) (string, error) {
 		c.guardianSess.Reset()
 	}
 	c.carryRecoveryState(newPath)
+	c.rotateSessionTemp()
 	c.snapshotMu.Unlock()
 	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 		Text: fmt.Sprintf("created branch %s", agent.BranchID(newPath))})
@@ -3668,6 +3739,7 @@ func (c *Controller) SwitchBranch(ref string) (agent.BranchInfo, error) {
 	c.restoreTerminalGoalTodos(match.Path)
 	c.loadGuardianSession()
 	c.loadRecoveryState(match.Path)
+	c.rotateSessionTemp()
 	c.snapshotMu.Unlock()
 	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 		Text: fmt.Sprintf("switched to branch %s", branchDisplayName(match))})
@@ -3771,10 +3843,16 @@ func (c *Controller) summarizeAt(ctx context.Context, turn int, from bool) error
 
 // Resume seeds the session from a loaded transcript and pins the active file to
 // its path so auto-save keeps appending there.
+//
+// When the controller already has a different non-empty session path, Resume
+// rotates the private temporary generation so the loaded conversation cannot
+// see the previous session's temporary files. Same-path Resume (hot rebuild
+// migration via AdoptHistory) keeps the generation.
 func (c *Controller) Resume(s *agent.Session, path string) {
 	// See snapshotMu: the swap must not interleave with an in-flight save.
 	// recoverInterruptedTurn and maybeColdResumePrune snapshot on their own,
 	// so they stay outside the locked section (snapshotMu is not reentrant).
+	prevPath := c.SessionPath()
 	c.snapshotMu.Lock()
 	if c.executor != nil {
 		c.executor.SetSession(s)
@@ -3786,13 +3864,21 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	c.mu.Unlock()
 	c.setActiveJobSession(path)
 	c.rebindCheckpoints(path)
-	c.goals.restoreFromState(path)
+	if migPath, migData, migrated := c.goals.restoreFromState(path); migrated {
+		// Persist legacy budget_tokens → running (and tokensLimit=0) so the
+		// next cold start does not re-enter the removed hard-limit pause.
+		// restoreFromState never issues a provider request.
+		c.persistGoalState(migPath, migData, true)
+	}
 	if c.executor != nil {
 		c.executor.RestoreDeliveryCheckpoint(c.goals.deliveryState())
 	}
 	c.restoreTerminalGoalTodos(path)
 	c.loadGuardianSession()
 	c.loadRecoveryState(path)
+	if shouldRotateSessionTempOnResume(prevPath, path) {
+		c.rotateSessionTemp()
+	}
 	c.snapshotMu.Unlock()
 	c.recoverCheckpointTransactions()
 	c.recoverInterruptedTurn(path)
@@ -3804,6 +3890,15 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	if err := c.extensionSessionPhase(context.Background(), extension.PointSessionLoad, dispatch.PhaseLoad, path); err != nil {
 		c.extensionWarn("session policy failed at session.load", err)
 	}
+}
+
+func shouldRotateSessionTempOnResume(prevPath, nextPath string) bool {
+	prevPath = strings.TrimSpace(prevPath)
+	nextPath = strings.TrimSpace(nextPath)
+	if prevPath == "" || nextPath == "" {
+		return false
+	}
+	return filepath.Clean(prevPath) != filepath.Clean(nextPath)
 }
 
 func (c *Controller) loadGuardianSession() {
@@ -4877,6 +4972,10 @@ func (c *Controller) setSessionPath(p string, fresh bool) {
 	c.rebindCheckpoints(p)
 	if fresh {
 		c.resetRecoveryForNewSession(p)
+		// A newly-created conversation must not share the previous logical
+		// session's temporary files (e.g. after EnsureSessionPath on a
+		// controller that already ran commands).
+		c.rotateSessionTemp()
 	} else {
 		c.loadRecoveryState(p)
 	}
@@ -5017,8 +5116,9 @@ func (c *Controller) Todos() []evidence.TodoItem {
 // ToolResultData holds the full arguments and output for one tool call, loaded
 // on demand when a frontend expands a collapsed tool card.
 type ToolResultData struct {
-	Args   string `json:"args"`
-	Output string `json:"output"`
+	Args      string                  `json:"args"`
+	Output    string                  `json:"output"`
+	Execution *provider.ToolExecution `json:"execution,omitempty"`
 }
 
 // ToolResult looks up a tool call by its ID in the session history and returns
@@ -5037,8 +5137,9 @@ func (c *Controller) ToolResult(toolID string) *ToolResultData {
 			continue
 		}
 		out := &ToolResultData{
-			Args:   "",
-			Output: msgs[i].Content,
+			Args:      "",
+			Output:    msgs[i].Content,
+			Execution: msgs[i].ToolExecution,
 		}
 		// Walk back to find the assistant turn that issued this call.
 		for j := i; j >= 0; j-- {
@@ -5701,7 +5802,33 @@ func (c *Controller) close(fireSessionEnd bool, jobsMode closeJobsMode) {
 		if c.cleanup != nil {
 			c.cleanup()
 		}
+		// Drop the Controller owner reference last so background job leases
+		// that outlive close still pin retired generations until they exit.
+		if c.sessionTemp != nil {
+			c.sessionTemp.Release()
+		}
 	})
+}
+
+// SessionTemp returns the logical-session private temporary directory manager.
+// Hot rebuilds pass this to the replacement Controller so the directory survives
+// model/settings swaps. Nil only when the Controller was constructed without one
+// (should not happen after New).
+func (c *Controller) SessionTemp() *sessiontemp.Manager {
+	if c == nil {
+		return nil
+	}
+	return c.sessionTemp
+}
+
+// rotateSessionTemp advances the private temporary generation so a new logical
+// session cannot see the previous session's temporary files. In-flight command
+// leases keep the old generation alive until they release.
+func (c *Controller) rotateSessionTemp() {
+	if c == nil || c.sessionTemp == nil {
+		return
+	}
+	c.sessionTemp.Rotate()
 }
 
 // Jobs returns the still-running background jobs for the status bar (nil when
@@ -6212,258 +6339,11 @@ func approvalTruncate(s string, maxRunes int) string {
 	return string(runes[:maxRunes]) + "..."
 }
 
-type seedTodo struct {
-	Content string `json:"content"`
-	Status  string `json:"status"`
-	Level   int    `json:"level,omitempty"`
-}
-
-// seedPlanTodos turns an approved plan into a starter task list and emits it as a
-// synthetic todo_write event, so the live task panel populates the instant the
-// user approves — a structural guarantee, not a prompt the model might ignore.
-// The model still flips item status as it works (only it knows its own
-// progress); this just makes the list exist. No-op when the plan has no list.
-func (c *Controller) seedPlanTodos(plan string) string {
-	args := PlanTodosJSON(plan)
-	if args == "" {
-		return ""
-	}
-	t := event.Tool{ID: "plan-seed", Name: "todo_write", Args: args, ReadOnly: true}
-	c.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: t})
-	t.Output = "task list seeded from the approved plan"
-	c.sink.Emit(event.Event{Kind: event.ToolResult, Tool: t})
-	c.seedAgentTodoState(args)
-	return args
-}
-
-func (c *Controller) seedAgentTodoState(args string) {
-	if c.executor == nil {
-		return
-	}
-	todos := agentTodoStateFromArgs(args)
-	if len(todos) == 0 {
-		return
-	}
-	c.executor.SeedTodoState(todos)
-}
-
-func (c *Controller) completePlanTodos(args string) {
-	if args == "" {
-		return
-	}
-	done := completedPlanTodosJSON(args)
-	if done == "" {
-		return
-	}
-	t := event.Tool{ID: "plan-seed", Name: "todo_write", Args: done, ReadOnly: true}
-	c.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: t})
-	t.Output = "approved plan finished"
-	c.sink.Emit(event.Event{Kind: event.ToolResult, Tool: t})
-	c.replaceAgentTodoState(done)
-}
-
-func (c *Controller) replaceAgentTodoState(args string) {
-	if c.executor == nil {
-		return
-	}
-	todos := agentTodoStateFromArgs(args)
-	if len(todos) == 0 {
-		return
-	}
-	c.executor.ReplaceTodoState(todos)
-}
-
-func agentTodoStateFromArgs(args string) []evidence.TodoItem {
-	var payload struct {
-		Todos []evidence.TodoItem `json:"todos"`
-	}
-	if err := json.Unmarshal([]byte(args), &payload); err != nil {
-		return nil
-	}
-	return payload.Todos
-}
-
-// PlanTodosJSON parses an approved plan's markdown into todo_write-shaped args
-// JSON ({"todos":[...]}), or "" when the plan has no list items. The exit_plan_mode
-// path seeds via seedPlanTodos (an event); a frontend whose own approval flow
-// bypasses exit_plan_mode (the chat TUI's text-plan approval) calls this directly
-// to render the same starter checklist. Shared parsing keeps the two consistent.
-func PlanTodosJSON(plan string) string {
-	items := parsePlanTodos(plan)
-	if len(items) == 0 {
-		return ""
-	}
-	// Host-generated state must obey the same contract as a model todo_write.
-	// Returning no seed is safer than showing a list the agent cannot advance.
-	if err := evidence.ValidateSerialTodos(seedTodoEvidenceState(items)); err != nil {
-		return ""
-	}
-	b, err := json.Marshal(map[string]any{"todos": items})
-	if err != nil {
-		return ""
-	}
-	return string(b)
-}
-
-func completedPlanTodosJSON(args string) string {
-	var p struct {
-		Todos []seedTodo `json:"todos"`
-	}
-	if err := json.Unmarshal([]byte(args), &p); err != nil || len(p.Todos) == 0 {
-		return ""
-	}
-	for i := range p.Todos {
-		p.Todos[i].Status = "completed"
-	}
-	b, err := json.Marshal(map[string]any{"todos": p.Todos})
-	if err != nil {
-		return ""
-	}
-	return string(b)
-}
-
-// parsePlanTodos extracts a starter task list from an approved plan's markdown
-// list items (bulleted or numbered), capped so a long plan can't flood the panel.
-// A flat list starts its first item; a layered list starts the first sub-step and
-// keeps its phase pending until every child is complete, matching todo_write's
-// serial state machine. It understands ONLY markdown lists
-// — an unambiguous, standard structure — and deliberately does not guess at prose,
-// tables, or arrow sequences (those need brittle, language-specific heuristics).
-// The plan-mode marker steers the model to present its plan as a list, so this
-// catches the normal case; anything it misses is covered by the model's own
-// todo_write calls as it executes.
-func parsePlanTodos(plan string) []seedTodo {
-	var todos []seedTodo
-	for _, raw := range strings.Split(plan, "\n") {
-		item, level, ok := listItem(raw)
-		if !ok {
-			continue
-		}
-		todos = append(todos, seedTodo{Content: item, Status: "pending", Level: level})
-		if len(todos) >= 20 {
-			break
-		}
-	}
-	if len(todos) == 0 {
-		return nil
-	}
-	// Be tolerant of a model that emits an indented bullet before a phase
-	// heading: promote the first item so the host never seeds an orphan L1.
-	if todos[0].Level == 1 {
-		todos[0].Level = 0
-	}
-	normalized := evidence.NormalizeSerialTodos(seedTodoEvidenceState(todos))
-	for i := range todos {
-		todos[i].Status = normalized[i].Status
-		todos[i].Level = normalized[i].Level
-	}
-	return todos
-}
-
-func seedTodoEvidenceState(todos []seedTodo) []evidence.TodoItem {
-	state := make([]evidence.TodoItem, len(todos))
-	for i, todo := range todos {
-		state[i] = evidence.TodoItem{
-			Content: todo.Content,
-			Status:  todo.Status,
-			Level:   todo.Level,
-		}
-	}
-	return state
-}
-
 func (c *Controller) sessionMessageCount() int {
 	if c.executor == nil {
 		return 0
 	}
 	return c.executor.Session().Len()
-}
-
-// hasTodoUpdateSince reports whether the model emitted its own todo_write after
-// index start, so the seeded plan todos aren't auto-completed over the model's
-// own bookkeeping.
-func (c *Controller) hasTodoUpdateSince(start int) bool {
-	if c.executor == nil {
-		return false
-	}
-	msgs := c.executor.Session().Messages
-	if start < 0 || start > len(msgs) {
-		start = len(msgs)
-	}
-	_, ok := latestTodoArgsSince(msgs, start)
-	return ok
-}
-
-func latestTodoArgsSince(msgs []provider.Message, start int) (string, bool) {
-	for i := len(msgs) - 1; i >= start; i-- {
-		for j := len(msgs[i].ToolCalls) - 1; j >= 0; j-- {
-			tc := msgs[i].ToolCalls[j]
-			if tc.Name == "todo_write" {
-				return tc.Arguments, true
-			}
-		}
-	}
-	return "", false
-}
-
-// listItem parses a markdown list line ("- x", "* x", "1. x", "2) x") into its
-// task text and a nesting level derived from leading indentation (0 for a
-// top-level item, 1 for an indented sub-step — capped at 1 since the plan is
-// two-level). ok is false when the line isn't a list item. Light inline-markdown
-// stripping keeps the checklist readable.
-func listItem(line string) (content string, level int, ok bool) {
-	trimmed := strings.TrimLeft(line, " \t")
-	if trimmed == "" {
-		return "", 0, false
-	}
-	indent := 0
-	for _, c := range line[:len(line)-len(trimmed)] {
-		if c == '\t' {
-			indent += 4
-		} else {
-			indent++
-		}
-	}
-	s := trimmed
-	// A numbered markdown heading ("### 1. Add the loader") is how models often
-	// write a phase even when asked for a list; strip the heading marker and
-	// treat it as a top-level phase. A heading without a number (a section
-	// title like "## Plan") falls through and is ignored.
-	heading := false
-	if h := strings.TrimLeft(s, "#"); h != s && strings.HasPrefix(h, " ") {
-		heading = true
-		s = strings.TrimSpace(h)
-	}
-	switch {
-	case strings.HasPrefix(s, "- "), strings.HasPrefix(s, "* "), strings.HasPrefix(s, "+ "):
-		s = s[2:]
-	default:
-		// numbered: leading digits, then "." or ")", then a space
-		i := 0
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			i++
-		}
-		if i == 0 || i+1 >= len(s) || (s[i] != '.' && s[i] != ')') || s[i+1] != ' ' {
-			return "", 0, false
-		}
-		s = s[i+2:]
-	}
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "[ ] ")
-	s = strings.TrimPrefix(s, "[x] ")
-	s = strings.ReplaceAll(s, "`", "")
-	s = strings.ReplaceAll(s, "**", "")
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", 0, false
-	}
-	if heading {
-		return s, 0, true // a heading is always a top-level phase
-	}
-	if indent >= 2 {
-		return s, 1, true
-	}
-	return s, 0, true
 }
 
 // parseRewind parses the arguments after "/rewind". The user may provide:
@@ -6587,6 +6467,7 @@ func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, too
 		}
 	}
 
+	c.approval.promptEmitMu.Lock()
 	var id string
 	var reply chan approvalReply
 	if opts.fresh || opts.requireHuman || tool == planApprovalTool {
@@ -6600,6 +6481,7 @@ func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, too
 	}
 
 	c.sink.Emit(c.approvalRequestEvent(event.Approval{ID: id, Tool: tool, Subject: subject, Reason: reason, RawInput: append(json.RawMessage(nil), args...), Fresh: opts.fresh}))
+	c.approval.promptEmitMu.Unlock()
 	// The agent now needs the user's attention; a Notification hook can ping an
 	// external channel (desktop notice, phone) while the run blocks on the reply.
 	go c.hooks.Notification(ctx, approvalNotificationText(tool, subject), "permission_prompt")
@@ -6653,77 +6535,4 @@ func (c *Controller) emitPlanModeReadOnlyCommandTrustResult(r PlanModeReadOnlyCo
 	case strings.TrimSpace(r.CoveredBy) != "":
 		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.PlanModeReadOnlyCommandTrustAlreadyFmt, r.Path, r.CoveredBy)})
 	}
-}
-
-// detectProjectModules scans the workspace root for top-level source directories
-// to enable module-aware task routing in /plan-exec.
-func (c *Controller) detectProjectModules() []string {
-	root := c.sessionDir
-	for i := 0; i < 3 && root != ""; i++ {
-		if hasFile(root, "go.mod") || hasFile(root, "package.json") || hasFile(root, ".git") {
-			return listSourceDirs(root, 2)
-		}
-		root = filepath.Dir(root)
-		if root == filepath.Dir(root) {
-			break
-		}
-	}
-	return nil
-}
-
-func hasFile(dir, name string) bool {
-	_, err := os.Stat(filepath.Join(dir, name))
-	return err == nil
-}
-
-func listSourceDirs(root string, maxDepth int) []string {
-	skip := map[string]bool{
-		".git": true, ".github": true, "node_modules": true,
-		"vendor": true, ".reasonix": true, "desktop": true,
-		"dist": true, "build": true, ".cache": true, "bin": true,
-	}
-	var dirs []string
-	walkDir(root, "", skip, maxDepth, &dirs)
-	return dirs
-}
-
-func walkDir(root, rel string, skip map[string]bool, depth int, out *[]string) {
-	if depth <= 0 {
-		return
-	}
-	dir := root
-	if rel != "" {
-		dir = filepath.Join(root, rel)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if !e.IsDir() || skip[name] || strings.HasPrefix(name, ".") {
-			continue
-		}
-		childRel := name
-		if rel != "" {
-			childRel = rel + "/" + name
-		}
-		if hasSourceFiles(filepath.Join(root, childRel)) {
-			*out = append(*out, childRel)
-		}
-		walkDir(root, childRel, skip, depth-1, out)
-	}
-}
-
-func hasSourceFiles(dir string) bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			return true
-		}
-	}
-	return false
 }

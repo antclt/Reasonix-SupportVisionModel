@@ -17,6 +17,9 @@ concurrency:
 
 jobs:
   deploy:
+    # This worker belongs to the upstream production project. Do not attempt
+    # a Cloudflare deployment from community forks that do not own its secrets.
+    if: github.repository == 'esengine/DeepSeek-Reasonix'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

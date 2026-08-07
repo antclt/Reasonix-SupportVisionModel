@@ -37,22 +37,14 @@ func rstAfter(t *testing.T, w http.ResponseWriter, prelude string) {
 	_ = conn.Close()
 }
 
-// TestStreamReconnectsOnEarlyConnReset reproduces issue #3148: a local proxy
-// (v2rayN/sing-box) forcibly closes the idle SSE connection during a reasoner's
-// first-token gap, before any token is emitted. The drop must be replayed
-// transparently — the caller sees one clean stream, never an error.
-func TestStreamReconnectsOnEarlyConnReset(t *testing.T) {
+// TestStreamSurfacesEarlyConnResetAsInterrupt moves body-phase replay to the
+// Agent: a pre-output connection reset is StreamInterruptedError, not an
+// in-provider transparent reconnect (avoids stacked retry budgets).
+func TestStreamSurfacesEarlyConnResetAsInterrupt(t *testing.T) {
 	var reqs int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqs++
-		if reqs == 1 {
-			rstAfter(t, w, ": keep-alive\n\n") // a comment line, zero model output
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n")
-		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		rstAfter(t, w, ": keep-alive\n\n") // a comment line, zero model output
 	}))
 	defer srv.Close()
 
@@ -65,27 +57,18 @@ func TestStreamReconnectsOnEarlyConnReset(t *testing.T) {
 		t.Fatalf("Stream: %v", err)
 	}
 
-	var text strings.Builder
-	var usage *provider.Usage
+	var gotInterrupted bool
 	for chunk := range ch {
 		if chunk.Type == provider.ChunkError {
-			t.Fatalf("early conn reset should be replayed, not surfaced: %v", chunk.Err)
-		}
-		if chunk.Type == provider.ChunkText {
-			text.WriteString(chunk.Text)
-		}
-		if chunk.Type == provider.ChunkUsage {
-			usage = chunk.Usage
+			var interrupted *provider.StreamInterruptedError
+			gotInterrupted = errors.As(chunk.Err, &interrupted)
 		}
 	}
-	if text.String() != "recovered" {
-		t.Errorf("text = %q, want %q", text.String(), "recovered")
+	if !gotInterrupted {
+		t.Error("early conn reset must surface as StreamInterruptedError for Agent replay")
 	}
-	if reqs != 2 {
-		t.Errorf("server saw %d requests, want 2 (one reset + one replay)", reqs)
-	}
-	if usage == nil || usage.RequestCount != 2 {
-		t.Errorf("usage request count = %+v, want 2", usage)
+	if reqs != 1 {
+		t.Errorf("server saw %d requests, want 1 (no provider body replay)", reqs)
 	}
 }
 
@@ -139,20 +122,14 @@ func TestStreamCancelDoesNotReconnect(t *testing.T) {
 
 // TestStreamTreatsCleanEOFWithoutDoneAsCut reproduces issue #3953: a proxy that
 // idle-closes the SSE connection with a clean FIN ends the scan with no error,
-// which used to commit the turn as complete — including half-streamed tool-call
-// arguments that then 400 on every replay. Before output, the cut must be
-// replayed; the caller sees one clean stream with the full tool call.
+// which used to commit the turn as complete. Body-phase cuts surface as
+// StreamInterruptedError so the Agent can replay the frozen request.
 func TestStreamTreatsCleanEOFWithoutDoneAsCut(t *testing.T) {
 	var reqs int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqs++
 		w.Header().Set("Content-Type", "text/event-stream")
-		if reqs == 1 {
-			_, _ = io.WriteString(w, ": keep-alive\n\n") // clean close, no [DONE], no finish_reason
-			return
-		}
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\": \\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = io.WriteString(w, ": keep-alive\n\n") // clean close, no [DONE], no finish_reason
 	}))
 	defer srv.Close()
 
@@ -165,20 +142,21 @@ func TestStreamTreatsCleanEOFWithoutDoneAsCut(t *testing.T) {
 		t.Fatalf("Stream: %v", err)
 	}
 
-	var call *provider.ToolCall
+	var gotInterrupted bool
 	for chunk := range ch {
 		switch chunk.Type {
-		case provider.ChunkError:
-			t.Fatalf("clean EOF before output should be replayed, not surfaced: %v", chunk.Err)
 		case provider.ChunkToolCall:
-			call = chunk.ToolCall
+			t.Fatalf("incomplete stream must not emit tool calls: %+v", chunk.ToolCall)
+		case provider.ChunkError:
+			var interrupted *provider.StreamInterruptedError
+			gotInterrupted = errors.As(chunk.Err, &interrupted)
 		}
 	}
-	if call == nil || call.Arguments != `{"cmd": "ls"}` {
-		t.Errorf("tool call = %+v, want complete arguments from the replay", call)
+	if !gotInterrupted {
+		t.Error("clean EOF before terminal must surface as StreamInterruptedError")
 	}
-	if reqs != 2 {
-		t.Errorf("server saw %d requests, want 2 (one cut + one replay)", reqs)
+	if reqs != 1 {
+		t.Errorf("server saw %d requests, want 1 (no provider body replay)", reqs)
 	}
 }
 
@@ -334,47 +312,5 @@ func TestStreamMaxRetriesZeroDisablesReconnect(t *testing.T) {
 	}
 	if reqs != 1 {
 		t.Errorf("server saw %d requests, want exactly 1 (no reconnect)", reqs)
-	}
-}
-
-// TestStreamMaxRetriesNegativeRestoresDefaultReconnect proves a negative
-// override keeps the package default: the early reset is still replayed.
-func TestStreamMaxRetriesNegativeRestoresDefaultReconnect(t *testing.T) {
-	var reqs int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqs++
-		if reqs == 1 {
-			rstAfter(t, w, ": keep-alive\n\n")
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	p, err := New(provider.Config{Name: "deepseek", BaseURL: srv.URL, Model: "deepseek-v4", APIKey: "k"})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	ctx := provider.WithMaxRetries(context.Background(), -1)
-	ch, err := p.Stream(ctx, provider.Request{Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}}})
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	var text strings.Builder
-	for chunk := range ch {
-		if chunk.Type == provider.ChunkError {
-			t.Fatalf("default budget should still replay: %v", chunk.Err)
-		}
-		if chunk.Type == provider.ChunkText {
-			text.WriteString(chunk.Text)
-		}
-	}
-	if text.String() != "ok" {
-		t.Fatalf("text = %q, want %q", text.String(), "ok")
-	}
-	if reqs != 2 {
-		t.Errorf("server saw %d requests, want 2 (default reconnect restored)", reqs)
 	}
 }

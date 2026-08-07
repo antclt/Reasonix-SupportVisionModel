@@ -39,6 +39,10 @@ func writeInstallerStaging(t *testing.T, root, label string, includeLauncher boo
 
 func TestMigrateFlatInstallToVersioned(t *testing.T) {
 	root := t.TempDir()
+	// The migrator reads the current repair transaction from the process-wide
+	// Reasonix home. Isolate it from a developer machine's real pending update;
+	// this test only exercises legacy markers beside the flat install.
+	t.Setenv("REASONIX_HOME", filepath.Join(root, "state"))
 	// Flat release unit.
 	for _, name := range installlayout.AllowedVersionMembers() {
 		if err := os.WriteFile(filepath.Join(root, name), []byte("flat-"+name), 0o755); err != nil {

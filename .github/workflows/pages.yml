@@ -17,6 +17,9 @@ concurrency:
 
 jobs:
   build:
+    # The public site is deployed only from the upstream repository. Community
+    # forks should not fail CI because GitHub Pages is not configured there.
+    if: github.repository == 'esengine/DeepSeek-Reasonix'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -38,6 +41,7 @@ jobs:
 
   deploy:
     needs: build
+    if: github.repository == 'esengine/DeepSeek-Reasonix'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

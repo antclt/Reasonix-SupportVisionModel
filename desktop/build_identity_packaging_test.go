@@ -21,7 +21,8 @@ func TestDesktopBuildLinksSharedSourceRevision(t *testing.T) {
 		`RELEASE_REPOSITORY="${REASONIX_RELEASE_REPOSITORY:-esengine/DeepSeek-Reasonix}"`,
 		`product_docs_ldflags="-X reasonix/internal/productdocs.linkedVersion=$VERSION -X reasonix/internal/productdocs.linkedRevision=$SOURCE_REVISION"`,
 		`ldflags="-X main.version=$VERSION -X main.channel=$CHANNEL -X main.releaseRepository=$RELEASE_REPOSITORY $product_docs_ldflags"`,
-		`-X main.version=$VERSION $product_docs_ldflags`,
+		`cli_identity_ldflags="-X main.version=$VERSION -X main.gitCommit=$GIT_COMMIT -X main.buildTimeUTC=$BUILD_TIME_UTC $product_docs_ldflags"`,
+		`cli_identity_ldflags`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("desktop-build.sh does not preserve the shared build identity %q", want)

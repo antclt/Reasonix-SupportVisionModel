@@ -55,6 +55,8 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 globalThis.window = dom.window as unknown as Window & typeof globalThis;
 globalThis.document = dom.window.document;
+Object.defineProperty(dom.window.navigator, "language", { value: "en-US", configurable: true });
+Object.defineProperty(globalThis, "navigator", { value: dom.window.navigator, configurable: true });
 globalThis.Node = dom.window.Node;
 globalThis.Element = dom.window.Element;
 globalThis.HTMLElement = dom.window.HTMLElement;
