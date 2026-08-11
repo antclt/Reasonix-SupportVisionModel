@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo-ghost-wave-effect.svg" alt="Reasonix" width="360"/>
+  <img src="docs/logo.svg" alt="Reasonix" width="640"/>
 </p>
 
 <h1 align="center">Reasonix Support Vision Model</h1>
@@ -14,23 +14,6 @@
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LinuxDO-yellow" alt="Linux DO community"/></a>
   <a href="https://github.com/esengine/DeepSeek-Reasonix"><img src="https://img.shields.io/badge/upstream-Reasonix-3fb950?style=flat-square" alt="Reasonix upstream"/></a>
 </p>
-
-<p align="center">
-  <a href="https://trendshift.io/repositories/27020?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-27020" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/27020/monthly?language=Go" alt="esengine/DeepSeek-Reasonix | Trendshift" width="250" height="55"/></a>
-  <a href="https://trendshift.io/repositories/27020?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-27020" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/27020" alt="esengine/DeepSeek-Reasonix | Trendshift" width="250" height="55"/></a>
-</p>
-
-<br/>
-
-<p align="center"><strong>Open source · MIT · a single Go binary</strong></p>
-<h3 align="center">A coding agent you can leave running.</h3>
-<p align="center">One local engine, four ways in — terminal, desktop app, browser, or your editor over ACP. Plan mode, permissions, a workspace sandbox and per-turn checkpoints keep a long autonomous run something you can still read and undo.</p>
-
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/ab2f3878-e224-4931-8254-060e7695cfb9" controls preload="metadata" width="560"></video>
-</div>
-
-<br/>
 
 > [!IMPORTANT]
 > 本项目不是 Reasonix 官方发行版，而是基于
