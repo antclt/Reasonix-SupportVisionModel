@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -120,14 +121,14 @@ type Options struct {
 	// so each tab loads its own config/skills/hooks without changing the process
 	// cwd — enabling concurrent multi-project sessions.
 	WorkspaceRoot string
-	// AutoPricingCurrency supplies a frontend-resolved pricing region when the
-	// persisted desktop currency and language settings are all automatic. It is
-	// applied to the in-memory config only and never turns Auto into a persisted
-	// CNY/USD choice.
+	// AutoPricingCurrency applies a frontend-resolved pricing region in memory
+	// without persisting an automatic choice.
 	AutoPricingCurrency string
-	// StatsSource labels this frontend's usage records (desktop/cli/serve).
-	// Empty disables usage recording for this controller.
+	// StatsSource labels usage records; empty disables usage recording.
 	StatsSource string
+	// OnConfigLoadWarnings accepts resilient-loader warnings. Returning true
+	// lets boot suppress the duplicate migration diagnostic.
+	OnConfigLoadWarnings func([]string) bool
 	// ExtraPlugins are session-scoped MCP servers supplied by a host transport
 	// (for example ACP session/new). They are connected eagerly for this
 	// controller but are not persisted to reasonix.toml.
@@ -191,12 +192,12 @@ type Options struct {
 	SandboxNetworkOverride *bool
 	SandboxBashOverride    string
 	WorkspaceOnly          bool
-	// SessionTemp is the logical-session private temporary directory manager.
-	// Rebuild passes the previous Controller's Manager so hot rebuilds keep
-	// temporary files. Empty creates a fresh Manager inside control.New.
-	// Frontends that build a replacement Controller without Rebuild must pass
-	// the same Manager for the same logical session.
+	// SessionTemp is the session-private temp manager; Rebuild reuses old's.
 	SessionTemp *sessiontemp.Manager
+	RuntimeReload
+	// deferPublish keeps a replacement generation private until migration and
+	// commit succeed. Cold BuildRuntime leaves this false and publishes at boot.
+	deferPublish bool
 }
 
 func recoveryHeadlessMode(opts Options) bool {
@@ -209,6 +210,7 @@ func recoveryHeadlessMode(opts Options) bool {
 // assembled. The returned controller owns plugin subprocesses; call Close
 // (via Controller.Close) to release them.
 func build(ctx context.Context, opts Options) (*BuildResult, error) {
+	ctx, opts, owner, fileWriteReceipt := bindRuntimeOwner(ctx, opts)
 	stderr := opts.Stderr
 	if stderr == nil {
 		stderr = os.Stderr
@@ -218,17 +220,19 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	// One-time import of v1/v0.5 legacy config — runs before Load so the freshly
-	// written config + ~/.env are picked up this same boot. CLI Run also calls this
-	// before config-only commands; this call stays as the shared frontend fallback.
+	// Import v1/v0.5 config before Load so this boot sees the new config + ~/.env.
+	// CLI Run also calls this before config-only commands; keep a shared fallback.
 	migrated, migErr := config.MigrateLegacyIfNeededForRoot(root)
+	deepSeekProtocolMigrated, deepSeekProtocolMigErr := config.MigrateLegacyDeepSeekProtocolUserConfig()
 	stepLimitsMigrated, stepLimitMigErr := config.MigrateLegacyAgentStepLimitsForRoot(root)
 	redactToolOutputMigrated, redactToolOutputMigErr := config.MigrateLegacyRedactToolOutputForRoot(root)
 	memoryCompilerMigrated, memoryCompilerMigErr := config.MigrateLegacyMemoryCompilerForRoot(root)
+	multiThresholdMigrated, multiThresholdMigErr := config.MigrateLegacyMultiThresholdCompactionForRoot(root)
 	cfg, err := config.LoadForRoot(root)
 	if err != nil {
 		return nil, err
 	}
+	deepSeekProtocolMigErr = deepSeekProtocolMigrationNoticeError(handleConfigLoadWarnings(opts, cfg), deepSeekProtocolMigErr)
 	applyRuntimeAutoPricingCurrency(cfg, opts.AutoPricingCurrency)
 	// Arm the credential-protection layers from the user-global [secrets]
 	// section before any tool, hook, or plugin subprocess can spawn. Package
@@ -257,14 +261,13 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		sink = stats.NewRecorder(sink, config.StatsDir(), source)
 	}
 	// Goal token-budget accounting: the controller detects this tee and
-	// attributes billable usage events to the active goal turn's recorder, so
-	// executor/planner/subagent/compaction/classifier/router/reviewer/evaluator
-	// calls under one Goal scope accumulate into its observational token total.
-	// The tee must
-	// sit on the shared sink the agents emit into.
-	sink = control.NewGoalUsageTee(sink)
+	// attributes billable usage to the active goal turn's recorder. Both the
+	// tee and the delta coalescer must ride the shared sink agents emit into
+	// directly — wrapping only the controller's reference would leave the
+	// executor's per-chunk Text/Reasoning stream uncoalesced.
+	sink = control.NewGoalUsageTee(event.Coalesce(sink, event.DefaultStreamDeltaWindow))
 
-	// Extension preflight (stages 5b/7): start the installed, enabled v1 runtime
+	// Extension preflight (stages 5b/7): start the installed, enabled v2 runtime
 	// packages ONCE, here, before model resolution, so plugin-namespaced refs
 	// (plugin/<plugin>/<provider>/<model>) resolve on the very first boot and the
 	// same sidecar generation feeds the executor, planner, guardian, sub-agents,
@@ -300,6 +303,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	extUIHub := uihub.New(uihub.Options{
 		SessionID:  sessionID,
 		Generation: generation,
+		Owner:      owner,
 		Emit: func(ev event.Event) {
 			if c := ctrlRef.Load(); c != nil {
 				c.EmitExtensionEvent(ev)
@@ -321,7 +325,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		session:   protocol.SessionContext{SessionID: sessionID, WorkspaceRoot: root, Generation: generation},
 		ui:        extUIHub,
 		onWarning: extWarn,
-	})
+	}, opts.Extensions, planForPreflight(opts, generation))
 	if err != nil {
 		return nil, fmt.Errorf("boot: %w", err)
 	}
@@ -363,10 +367,11 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			if claimsErr != nil {
 				return nil, fmt.Errorf("boot: %w", claimsErr)
 			}
-			merged, mergeErr := mergeSidecarProviders(baseResolver, extensionMgr, claims)
+			merged, mergeErr := mergeSidecarProviders(baseResolver, extensionMgr, claims, owner)
 			if mergeErr != nil {
 				return nil, fmt.Errorf("boot: %w", mergeErr)
 			}
+			installSidecarStreamRouters(extensionMgr, merged)
 			effectiveResolver = merged
 			extensionResolver = merged
 		}
@@ -425,6 +430,21 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	} else if migrated != nil {
 		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: migrated.Notice()})
 	}
+	if deepSeekProtocolMigrated {
+		sink.Emit(event.Event{
+			Kind:   event.Notice,
+			Level:  event.LevelInfo,
+			Text:   "DeepSeek official access was upgraded to Anthropic Messages.",
+			Detail: "Your unmodified legacy OpenAI Chat Completions configuration now uses DeepSeek's recommended Anthropic endpoint with server-side web search. Existing model names and pricing were preserved. The first request starts a new provider cache prefix; later requests rebuild normal prefix-cache reuse.",
+		})
+	} else if deepSeekProtocolMigErr != nil {
+		sink.Emit(event.Event{
+			Kind:   event.Notice,
+			Level:  event.LevelWarn,
+			Text:   "DeepSeek protocol migration did not complete.",
+			Detail: deepSeekProtocolMigErr.Error(),
+		})
+	}
 	if stepLimitsMigrated || cfg.IgnoredLegacyAgentStepLimits() {
 		level := event.LevelInfo
 		text := "Deprecated agent step limits were removed."
@@ -463,6 +483,17 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			level = event.LevelWarn
 			text = "Deprecated memory_compiler setting was ignored."
 			detail += " The old key could not be removed: " + memoryCompilerMigErr.Error()
+		}
+		sink.Emit(event.Event{Kind: event.Notice, Level: level, Text: text, Detail: detail})
+	}
+	if multiThresholdMigrated || multiThresholdMigErr != nil {
+		level := event.LevelInfo
+		text := "上下文维护已简化为单一自动压缩阈值。"
+		detail := "Context maintenance now uses a single automatic compact_ratio (default 0.85). soft_compact_ratio, tool_result_snip_ratio, compact_force_ratio, cold_resume_prune, and context_editing were removed from config."
+		if multiThresholdMigErr != nil {
+			level = event.LevelWarn
+			text = "Deprecated multi-threshold compaction keys were ignored."
+			detail += " The old keys could not be removed: " + multiThresholdMigErr.Error()
 		}
 		sink.Emit(event.Event{Kind: event.Notice, Level: level, Text: text, Detail: detail})
 	}
@@ -520,7 +551,6 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	execProv, err := resolveProvider(effectiveResolver, cfg, proxySpec, provider.Selection{Ref: modelRef, Effort: opts.EffortOverride})
 	if err != nil {
 		return nil, err
@@ -544,8 +574,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	if st, ok := outputstyle.Resolve(cfg.Agent.OutputStyle, outputstyle.Dirs()); ok {
 		sysPrompt = outputstyle.Apply(sysPrompt, st)
 	}
-	sysPrompt += "\n\n" + config.UserDecisionPolicy
-	sysPrompt += "\n\n" + config.LanguagePolicy
+	sysPrompt = appendCorePolicies(sysPrompt)
 	if workspaceLine := currentWorkspacePromptLine(root); workspaceLine != "" {
 		sysPrompt += "\n\n" + workspaceLine
 	}
@@ -577,6 +606,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			sysPrompt += "\n\n" + envSection
 		}
 	}
+	sysPrompt = appendOfflineEnvironmentNote(sysPrompt, cfg.Environment.Offline)
 
 	// Persistent memory (REASONIX.md / AGENTS.md hierarchy + auto-memory index)
 	// folds into the system prompt exactly here, once: it becomes part of the
@@ -590,29 +620,36 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	projectChecks := instruction.ExtractHostChecks(mem.Docs)
 	sysPrompt = memory.Compose(sysPrompt, mem)
 
-	// Skills: discover playbooks (built-in + project/custom/global) and fold their
-	// one-liner index into the same cache-stable prefix — names + descriptions
-	// only; bodies load on demand via run_skill or "/<name>". Bodies never enter
-	// the prefix, so the index costs a fixed, small amount per turn.
-	skillStore := skill.New(skill.Options{
-		ProjectRoot:      root,
-		CustomPaths:      cfg.SkillCustomPaths(),
-		PluginPaths:      cfg.PluginPackageSkillOwners(),
-		PluginAgentPaths: cfg.PluginPackageAgentOwners(),
-		ExcludedPaths:    cfg.SkillExcludedPaths(),
-		DisabledNames:    cfg.DisabledSkillNames(),
-		MaxDepth:         cfg.SkillMaxDepth(),
-		Stderr:           opts.Stderr,
-	})
-	// Install the static profile filter before building the prompt index and
-	// dedicated skill tools. The dependency checker is attached once the live
-	// registry/plugin host has been assembled below.
-	skillStore.ConfigureInvocationPolicy(string(runtimeProfile), nil)
-	skills := skillStore.List()
-	allSkillStore := skill.New(skill.Options{ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), PluginPaths: cfg.PluginPackageSkillOwners(), PluginAgentPaths: cfg.PluginPackageAgentOwners(), ExcludedPaths: cfg.SkillExcludedPaths(), MaxDepth: cfg.SkillMaxDepth(), Stderr: io.Discard})
-	allSkills := allSkillStore.List()
-	if !tokenEconomy {
-		sysPrompt = skill.ApplyIndex(sysPrompt, skills)
+	implicitSkillInvocation := cfg.ImplicitSkillInvocationEnabled()
+	// Skills: rediscovery skipped on no-op/interceptor/UI rebuilds when
+	// ReuseAssembly is retained from the previous BuildResult.
+	var skillStore *skill.Store
+	var skills []skill.Skill
+	var allSkillStore *skill.Store
+	var allSkills []skill.Skill
+	canReuseSkills := opts.ReuseAssembly != nil && shouldReuseDiscovery(opts.PreviousPlan) &&
+		opts.ReuseAssembly.ImplicitSkillInvocation == implicitSkillInvocation
+	if canReuseSkills {
+		skills = opts.ReuseAssembly.Skills
+		allSkills = skills
+		skillStore = skill.New(skill.Options{ProjectRoot: root, Stderr: io.Discard})
+		allSkillStore = skillStore
+		if s := strings.TrimSpace(opts.ReuseAssembly.SystemPrompt); s != "" {
+			sysPrompt = s
+		}
+	} else {
+		skillStore = skill.New(skill.Options{
+			ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), PluginPaths: cfg.PluginPackageSkillOwners(),
+			PluginAgentPaths: cfg.PluginPackageAgentOwners(), ExcludedPaths: cfg.SkillExcludedPaths(),
+			DisabledNames: cfg.DisabledSkillNames(), MaxDepth: cfg.SkillMaxDepth(), Stderr: opts.Stderr,
+		})
+		skillStore.ConfigureInvocationPolicy(string(runtimeProfile), nil)
+		skills = skillStore.List()
+		allSkillStore = skill.New(skill.Options{ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), PluginPaths: cfg.PluginPackageSkillOwners(), PluginAgentPaths: cfg.PluginPackageAgentOwners(), ExcludedPaths: cfg.SkillExcludedPaths(), MaxDepth: cfg.SkillMaxDepth(), Stderr: io.Discard})
+		allSkills = allSkillStore.List()
+		if !tokenEconomy && implicitSkillInvocation {
+			sysPrompt = skill.ApplyIndex(sysPrompt, skills)
+		}
 	}
 
 	reg := tool.NewRegistry()
@@ -670,7 +707,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	// startup built-ins. Do not pass that filtered empty slice to addBuiltins,
 	// where an empty list intentionally means "all built-ins".
 	if !tokenEconomy || len(cfg.Tools.Enabled) == 0 || len(enabledBuiltins) > 0 {
-		addBuiltins(reg, enabledBuiltins, writeRoots, bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, forbidReadRoots, readPathResolver, sessionGuard, managedConfig, opts.FileOverlay, opts.TerminalRunner, sessionTemp)
+		addBuiltins(reg, enabledBuiltins, writeRoots, bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, forbidReadRoots, readPathResolver, sessionGuard, managedConfig, opts.FileOverlay, opts.TerminalRunner, sessionTemp, fileWriteReceipt)
 	}
 	// Use the caller-supplied shared host when set, so controllers for the same
 	// workspace root reuse running MCP processes (e.g. one CodeGraph daemon
@@ -694,6 +731,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		ForbidReadRoots:       forbidReadRoots,
 		Network:               networkEnabled,
 		PackageOwners:         pluginPackageOwners(cfg),
+		OAuthHTTPClient:       balanceClient,
 	}
 	autoStartEntries := cfg.EnabledPlugins(root, config.DefaultMCPActivationStore())
 	enabledMCPNames := make(map[string]bool, len(autoStartEntries))
@@ -897,10 +935,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		cleanup = func() { prev(); lspMgr.Close() }
 	}
 
-	maxSteps := 0
-	if opts.MaxSteps > 0 {
-		maxSteps = opts.MaxSteps
-	}
+	maxSteps := max(opts.MaxSteps, 0)
 	subagentStore, err := newSubagentStore(sessionDir, opts.SubagentParentLive)
 	if err != nil {
 		return nil, err
@@ -923,11 +958,12 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		WithSessionAllow(opts.PermissionAllow)
 	headlessGate := control.NewSharedHeadlessGate(policy, opts.HeadlessApprovalMode)
 
-	// Hooks: load the global settings.json plus the project's. Non-blocking hook
-	// output is surfaced to the user as a Notice through the shared sink. The
-	// runner fires PreToolUse/PostToolUse in the agent loop and
-	// PermissionRequest/UserPromptSubmit/Stop at the controller boundary.
-	resolvedHooks := hook.Load(hook.LoadOptions{ProjectRoot: root})
+	var resolvedHooks []hook.ResolvedHook
+	if opts.ReuseAssembly != nil && shouldReuseDiscovery(opts.PreviousPlan) {
+		resolvedHooks = opts.ReuseAssembly.Hooks
+	} else {
+		resolvedHooks = hook.Load(hook.LoadOptions{ProjectRoot: root})
+	}
 	hookRuntime := hook.RuntimeOptions{}
 	if shell.Kind == sandbox.ShellBash {
 		hookRuntime.BashPath = shell.Path
@@ -991,17 +1027,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		if !ok || sk.RunAs != skill.RunSubagent {
 			return agent.ProfileDefinition{}, false
 		}
-		sk = skillStore.Prepare(sk)
-		return agent.ProfileDefinition{
-			Name:         sk.Name,
-			Body:         sk.Body,
-			AllowedTools: sk.AllowedTools,
-			Model:        sk.Model,
-			Effort:       sk.Effort,
-			ReadOnly:     sk.ReadOnly,
-			Invocation:   sk.Invocation,
-			NamedBuiltin: agent.NamedBuiltinProfile(sk.Name),
-		}, true
+		return agent.ProfileFromSkill(skillStore.Prepare(sk)), true
 	}
 	profileConfigModel := func(profile string) string {
 		for _, key := range SubagentModelKeys(profile) {
@@ -1019,9 +1045,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		}
 		return ""
 	}
-	bashSandboxEnforced := func() bool {
-		return bashSpec.Enforce()
-	}
+	bashSandboxEnforced := bashSpec.Enforce
 	taskToolAdded := false
 	readOnlyTaskToolAdded := false
 	var taskTool *agent.TaskTool
@@ -1078,6 +1102,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			ToolResultSnipRatio: cfg.Agent.ToolResultSnipRatio,
 			CompactRatio:        cfg.Agent.CompactRatio,
 			CompactForceRatio:   cfg.Agent.CompactForceRatio,
+			ContextEditing:      cfg.Agent.ContextEditing,
 			Temperature:         cfg.Agent.Temperature,
 			ArchiveDir:          config.ArchiveDir(),
 			SysPrompt:           "",
@@ -1223,6 +1248,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			ToolResultSnipRatio: cfg.Agent.ToolResultSnipRatio,
 			CompactRatio:        cfg.Agent.CompactRatio,
 			CompactForceRatio:   cfg.Agent.CompactForceRatio,
+			ContextEditing:      cfg.Agent.ContextEditing,
 			ArchiveDir:          config.ArchiveDir(),
 			KeepPolicy:          keepPolicy,
 			ResponseLanguage:    agent.ResponseLanguageFromContext(sctx),
@@ -1295,7 +1321,11 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		if runOptions.DeliveryProfile {
 			runOptions.RequireReviewReportKind = agent.ReviewReportKindForSkill(sk.Name)
 		}
-		return agent.RunReadOnlySubAgentWithSession(sctx, prov, subReg, agent.NewSession(sysPrompt), task,
+		// Provider serializers decide whether these images are wire-visible from
+		// the child model's own vision capability. Text-only children retain the
+		// attachment metadata locally but never receive image parts on the wire.
+		childCtx := agent.WithUserImages(sctx, agent.SubagentImageCandidates(sctx))
+		return agent.RunReadOnlySubAgentWithSession(childCtx, prov, subReg, agent.NewSession(sysPrompt), task,
 			runOptions, agent.NestedSink(sctx, event.Discard))
 	}
 	// Writer-capable subagent skills reuse the sub-agent machinery via this
@@ -1419,11 +1449,14 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			runOptions.RequireReviewReportKind = agent.ReviewReportKindForSkill(sk.Name)
 		}
 		var answer string
+		// See the read-only runner above: the child provider, not the parent
+		// model, owns the final vision decision.
+		childCtx := agent.WithUserImages(sctx, agent.SubagentImageCandidates(sctx))
 		if sk.ReadOnly {
-			answer, err = agent.RunReadOnlySubAgentWithSession(sctx, prov, subReg, run.Session, task,
+			answer, err = agent.RunReadOnlySubAgentWithSession(childCtx, prov, subReg, run.Session, task,
 				runOptions, agent.NestedSink(sctx, event.Discard))
 		} else {
-			answer, err = agent.RunSubAgentWithSession(sctx, prov, subReg, run.Session, task,
+			answer, err = agent.RunSubAgentWithSession(childCtx, prov, subReg, run.Session, task,
 				runOptions, agent.NestedSink(sctx, event.Discard))
 		}
 		if err != nil {
@@ -1441,9 +1474,12 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		}
 		return &event.Profile{Model: model, Effort: effort}
 	}
-	// Custom slash commands (.reasonix/commands + user dir). Best-effort: a malformed
-	// file is skipped, and a load error never blocks the session.
-	cmds, _ := command.LoadRoots(config.CommandRootsForRoot(root)...)
+	var cmds []command.Command
+	if opts.ReuseAssembly != nil && shouldReuseDiscovery(opts.PreviousPlan) {
+		cmds = opts.ReuseAssembly.Commands
+	} else {
+		cmds, _ = command.LoadRoots(config.CommandRootsForRoot(root)...)
+	}
 	slashCommandAdded := false
 	slashCommandIncludesSkills := false
 	addSlashCommandTool := func(includeSkills bool) string {
@@ -1453,9 +1489,8 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		// Expose loaded slash commands to the model via slash_command. In economy
 		// mode skills join this list only after the skills source is enabled.
 		var slashEntries []command.SlashEntry
-		if includeSkills {
+		if includeSkills && implicitSkillInvocation {
 			for _, sk := range skillStore.SlashList() {
-				sk := sk
 				slashEntries = append(slashEntries, command.SlashEntry{
 					Name:        sk.SlashName(),
 					Description: sk.Description,
@@ -1467,7 +1502,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			if cmd.Hidden {
 				continue
 			}
-			cmd := cmd
+
 			slashEntries = append(slashEntries, command.SlashEntry{
 				Name:        cmd.Name,
 				Description: cmd.Description,
@@ -1546,32 +1581,42 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	}
 	readOnlySkillToolsAdded := false
 	addReadOnlySkillTools := func() string {
+		if !implicitSkillInvocation {
+			return "automatic skill invocation is disabled; use an explicit /skill command instead."
+		}
 		if readOnlySkillToolsAdded {
 			return "read_only_skill tool is already enabled.\n\n" + skill.ReadOnlyIndexBlock(skills)
 		}
 		readOnlySkillToolsAdded = true
-		reg.Add(skill.NewReadOnlySkillTool(skillStore, readOnlySkillRunner, skillProfile))
+		reg.Add(skill.NewReadOnlySkillTool(skillStore, gateSubagentArm(opts.Ablation, readOnlySkillRunner), skillProfile))
 		return "enabled read_only_skill. Use read_only_skill for inline skills or read-only subagent skills on the next model request.\n\n" + skill.ReadOnlyIndexBlock(skills)
 	}
 	skillToolsAdded := false
 	addSkillTools := func() string {
+		if !implicitSkillInvocation {
+			return "automatic skill invocation is disabled; use an explicit /skill command instead."
+		}
 		if skillToolsAdded {
 			return "skills are already enabled.\n\n" + skill.IndexBlock(skills)
 		}
 		skillToolsAdded = true
 		addReadOnlySkillTools()
-		reg.Add(skill.NewRunSkillTool(skillStore, skillRunner, skillProfile))
+		reg.Add(skill.NewRunSkillTool(skillStore, gateSubagentArm(opts.Ablation, skillRunner), skillProfile))
 		reg.Add(skill.NewReadSkillTool(skillStore))
 		reg.Add(skill.NewInstallSkillTool(skillStore, nil))
-		for _, t := range skill.BuiltinSubagentTools(skillStore, skillRunner, skillProfile) {
+		for _, t := range builtinSubagentTools(opts.Ablation, skillStore, skillRunner, skillProfile) {
 			reg.Add(t)
 		}
-		addSlashCommandTool(true)
+		addSlashCommandTool(implicitSkillInvocation)
 		return "enabled skills. Use run_skill/read_skill/read_only_skill or the dedicated skill tools on the next model request.\n\n" + skill.IndexBlock(skills)
 	}
 	if !tokenEconomy {
 		addInstallSourceTool()
-		addSkillTools()
+		if implicitSkillInvocation {
+			addSkillTools()
+		} else {
+			addSlashCommandTool(false)
+		}
 	}
 	if tokenEconomy {
 		addBuiltinSourceTools := func(source string, names ...string) string {
@@ -1588,19 +1633,20 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 				return source + " tools are already enabled or disabled by [tools].enabled."
 			}
 			installed := addTools(reg, builtin.Workspace{
-				Dir:             root,
-				WriteRoots:      writeRoots,
-				ForbidReadRoots: forbidReadRoots,
-				Bash:            bashSpec,
-				BashTimeout:     bashTimeout,
-				Search:          searchSpec,
-				ProxySpec:       proxySpec,
-				ReadPaths:       readPathResolver,
-				SessionGuard:    sessionGuard,
-				ManagedConfig:   managedConfig,
-				FileOverlay:     opts.FileOverlay,
-				Terminal:        opts.TerminalRunner,
-				SessionTemp:     sessionTemp,
+				Dir:              root,
+				WriteRoots:       writeRoots,
+				ForbidReadRoots:  forbidReadRoots,
+				Bash:             bashSpec,
+				BashTimeout:      bashTimeout,
+				Search:           searchSpec,
+				ProxySpec:        proxySpec,
+				ReadPaths:        readPathResolver,
+				SessionGuard:     sessionGuard,
+				ManagedConfig:    managedConfig,
+				FileOverlay:      opts.FileOverlay,
+				Terminal:         opts.TerminalRunner,
+				SessionTemp:      sessionTemp,
+				FileWriteReceipt: fileWriteReceipt,
 			}.Tools(missing...))
 			return "enabled " + strings.Join(installed, ", ") + "."
 		}
@@ -1816,6 +1862,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		MaxSteps:    maxSteps,
 		MaxStepsKey: opts.MaxStepsKey,
 		Temperature: cfg.Agent.Temperature,
+		TaskBudget:  taskBudgetFromConfig(cfg),
 		Pricing:     entry.Price,
 		ModelRef:    modelRef,
 		Gate:        headlessGate,
@@ -1836,6 +1883,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		ToolResultSnipRatio:          cfg.Agent.ToolResultSnipRatio,
 		CompactRatio:                 cfg.Agent.CompactRatio,
 		CompactForceRatio:            cfg.Agent.CompactForceRatio,
+		ContextEditing:               cfg.Agent.ContextEditing,
 		RecentKeep:                   cfg.Agent.RecentKeep,
 		ArchiveDir:                   config.ArchiveDir(),
 		KeepPolicy:                   keepPolicy,
@@ -1893,6 +1941,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 				ToolResultSnipRatio:          cfg.Agent.ToolResultSnipRatio,
 				CompactRatio:                 cfg.Agent.CompactRatio,
 				CompactForceRatio:            cfg.Agent.CompactForceRatio,
+				ContextEditing:               cfg.Agent.ContextEditing,
 				RecentKeep:                   cfg.Agent.RecentKeep,
 				ArchiveDir:                   config.ArchiveDir(),
 				KeepPolicy:                   keepPolicy,
@@ -1939,6 +1988,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		Memory:              mem,
 		VisionModelRef:      strings.TrimSpace(cfg.Agent.VisionModel),
 		VisionDescriber:     visionDescriber,
+		DisableImplicitSkillInvocation: !implicitSkillInvocation,
 		// Indirection: the cleanup variable gains the extension runtime set at
 		// the end of build (snapshot assembly runs after control.New), and the
 		// controller must observe the final chain at Close time.
@@ -1984,7 +2034,9 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		OnSessionRecovered:  opts.OnSessionRecovered,
 		// The merged catalog (nil without provider-declaring sidecars) lets
 		// frontends enumerate plugin/... models through ProviderCatalog.
-		ProviderResolver: extensionResolver,
+		ProviderResolver:  extensionResolver,
+		RuntimeGeneration: generation,
+		RuntimeOwner:      owner,
 		// Share the Manager already bound into bash/grep so tools and the
 		// Controller observe the same temporary generation across rebuilds.
 		SessionTemp: sessionTemp,
@@ -2133,9 +2185,11 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		mcpSpecs:     mcpSpecs,
 		providers:    baseResolver.Catalog(),
 	}, generation, extensionBoot{
-		session:   protocol.SessionContext{SessionID: sessionID, WorkspaceRoot: root, Generation: generation},
-		ui:        extUIHub,
-		onWarning: extWarn,
+		session:            protocol.SessionContext{SessionID: sessionID, WorkspaceRoot: root, Generation: generation},
+		ui:                 extUIHub,
+		onWarning:          extWarn,
+		skipPromptStrategy: shouldSkipPromptStrategy(opts.PreviousPlan),
+		previousDispatcher: opts.PreviousDispatcher,
 	}, extensionMgr)
 	// Ownership of the preflighted Manager transferred to assembly on every
 	// path: it was either closed inside or registered into the RuntimeSet.
@@ -2173,25 +2227,15 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 	if extensionResolver != nil {
 		providerResolver = extensionResolver
 	}
-	// The runtime set (extension sidecar Manager, when any) is owned by the
-	// controller: chain its close into the controller cleanup the way LSP
-	// cleanup is chained, so sidecars live exactly as long as their
-	// controller. RuntimeSet.Close is idempotent, so double-close paths
-	// (Rebuild's fail-atomic cleanup) stay safe.
-	prevCleanup := cleanup
-	cleanup = func() { prevCleanup(); _ = runtimeSet.Close() }
-	// The dispatcher only exists once sidecars started and the snapshot froze,
-	// both of which happen after control.New — hand it to the already-built
-	// controller before the build returns. Nil (no sidecars, or a degraded
-	// snapshot) leaves the controller byte-identical to the pre-dispatch path.
+	cleanup = wireRuntimeScopeCleanup(runtimeSet, cleanup, opts.SharedHost, pluginHost, lspMgr, opts.SessionTemp)
 	ctrl.SetExtensions(extensionDispatcher)
-	// Stage 8a: the UI hub only earns its place on the controller when
-	// sidecars actually started — with none, the hub is dropped here and the
-	// session behaves exactly as if it never existed.
 	if extensionMgr == nil {
 		extUIHub = nil
 	} else {
 		ctrl.SetExtensionUI(extUIHub)
+	}
+	if providerResolver != nil {
+		ctrl.SetProviderResolver(providerResolver)
 	}
 	// Stage 6b2 system-prompt handoff: the 6b1 strategy pass may have replaced
 	// the prompt while the snapshot was freezing, but the executor session was
@@ -2203,7 +2247,15 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			ctrl.ApplyExtensionSystemPrompt(final)
 		}
 	}
-	return &BuildResult{Controller: ctrl, Snapshot: snap, Runtime: runtimeSet, Extensions: extensionMgr, Dispatcher: extensionDispatcher, ExtensionUI: extUIHub, ProviderResolver: providerResolver}, nil
+	assembly := &ReusedAssembly{
+		SystemPrompt:            sysPrompt,
+		Skills:                  skills,
+		Commands:                cmds,
+		Hooks:                   resolvedHooks,
+		Registry:                reg,
+		ImplicitSkillInvocation: implicitSkillInvocation,
+	}
+	return finalizeBuildResult(&BuildResult{Controller: ctrl, Snapshot: snap, Runtime: runtimeSet, Owner: owner, Extensions: extensionMgr, Dispatcher: extensionDispatcher, ExtensionUI: extUIHub, ProviderResolver: providerResolver, BaseProviderResolver: baseResolver, Assembly: assembly}, !opts.deferPublish), nil
 }
 
 // effectivePlannerModel centralizes planner precedence. The explicit ACP hard
@@ -2410,13 +2462,7 @@ func SubagentModelKeys(name string) []string {
 		if alias == "" {
 			continue
 		}
-		seen := false
-		for _, key := range keys {
-			if key == alias {
-				seen = true
-				break
-			}
-		}
+		seen := slices.Contains(keys, alias)
 		if !seen {
 			keys = append(keys, alias)
 		}
@@ -2657,23 +2703,22 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 		// provider-kind-specific knobs. EffectiveEffort applies a configured
 		// default_effort when the user has not explicitly selected /effort.
 		Extra: map[string]any{
-			"api_key_env":           e.APIKeyEnv,
-			"api_key_source":        e.APIKeySourceLabel(),
-			"thinking":              e.Thinking,
-			"effort":                config.EffectiveEffort(e),
-			"supported_efforts":     e.SupportedEfforts,
-			"reasoning_protocol":    config.ReasoningProtocolForEntry(e),
-			"max_output_tokens":     e.MaxOutputTokens,
-			"chat_url":              e.ChatURL,
-			"headers":               e.Headers,
-			"extra_body":            e.ExtraBody,
-			"auth_header":           e.AuthHeader,
-			"proxy_spec":            proxy,
-			"vision":                config.EffectiveVision(e),
-			"vision_model_explicit": config.ExplicitModelVision(e),
-			"vision_detail":         e.VisionDetail,
-			"web_search":            config.EffectiveWebSearch(e),
-			"mode":                  e.ResponsesMode,
+			"api_key_env":        e.APIKeyEnv,
+			"api_key_source":     e.APIKeySourceLabel(),
+			"thinking":           e.Thinking,
+			"effort":             config.EffectiveEffort(e),
+			"supported_efforts":  e.SupportedEfforts,
+			"reasoning_protocol": config.ReasoningProtocolForEntry(e),
+			"max_output_tokens":  e.MaxOutputTokens,
+			"chat_url":           e.ChatURL,
+			"headers":            e.Headers,
+			"extra_body":         e.ExtraBody,
+			"auth_header":        e.AuthHeader,
+			"proxy_spec":         proxy,
+			"vision":             config.EffectiveVision(e),
+			"vision_detail":      e.VisionDetail,
+			"web_search":         config.EffectiveWebSearch(e),
+			"mode":               e.ResponsesMode,
 			// Keep nil as nil so the responses provider can vendor-detect its
 			// default instead of accidentally treating every endpoint as stateful.
 			"stateful": e.ResponsesStateful,
@@ -2693,12 +2738,12 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 // and makes bash warn when a command references them. managedConfig names the
 // Reasonix-owned config files writable outside writeRoots after a fresh
 // per-write human approval.
-func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec, forbidReadRoots []string, readPathResolver *builtin.PathResolver, sessionGuard builtin.SessionDataGuard, managedConfig builtin.ManagedConfigPaths, overlay builtin.FileOverlay, terminal builtin.TerminalRunner, sessionTemp *sessiontemp.Manager) {
+func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec, forbidReadRoots []string, readPathResolver *builtin.PathResolver, sessionGuard builtin.SessionDataGuard, managedConfig builtin.ManagedConfigPaths, overlay builtin.FileOverlay, terminal builtin.TerminalRunner, sessionTemp *sessiontemp.Manager, fileWriteReceipt func(path string, hadPrior bool, prior []byte)) {
 	// If a workspace directory is set, use workspace-bound tools that resolve
 	// paths relative to that directory. Otherwise fall back to the process-cwd
 	// compile-time builtins.
 	if workDir != "" {
-		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, ForbidReadRoots: forbidReadRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec, ReadPaths: readPathResolver, SessionGuard: sessionGuard, ManagedConfig: managedConfig, FileOverlay: overlay, Terminal: terminal, SessionTemp: sessionTemp}
+		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, ForbidReadRoots: forbidReadRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec, ReadPaths: readPathResolver, SessionGuard: sessionGuard, ManagedConfig: managedConfig, FileOverlay: overlay, Terminal: terminal, SessionTemp: sessionTemp, FileWriteReceipt: fileWriteReceipt}
 		for _, t := range ws.Tools(enabled...) {
 			reg.Add(t)
 		}
@@ -2730,7 +2775,11 @@ func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sand
 	if rebound, ok := builtin.BindSessionTemp(searchTool, sessionTemp); ok {
 		searchTool = rebound
 	}
-	confined := append(builtin.ConfineWriters(writeRoots, sessionGuard, managedConfig),
+	writers := builtin.ConfineWriters(writeRoots, sessionGuard, managedConfig)
+	for i, writer := range writers {
+		writers[i] = builtin.BindFileWriteReceipt(writer, fileWriteReceipt)
+	}
+	confined := append(writers,
 		bashTool,
 		searchTool,
 		builtin.ConfineWebFetch(proxySpec))
@@ -2783,20 +2832,6 @@ func PluginSpecsForRoot(entries []config.PluginEntry, workspaceRoot string) []pl
 	return PluginSpecsForRootWithOptions(entries, workspaceRoot, PluginSpecOptions{})
 }
 
-// PluginSpecOptions carries runtime policy that is not stored on each plugin
-// entry but still needs to reach plugin.Spec.
-type PluginSpecOptions struct {
-	DefaultStartupTimeout time.Duration
-	DefaultCallTimeout    time.Duration
-	LaunchManager         *mcplaunch.Manager
-	ConfigSource          string
-	StateHome             string
-	WriterRoots           []string
-	ForbidReadRoots       []string
-	Network               bool
-	PackageOwners         map[string]string
-}
-
 // PluginSpecsForRootWithOptions maps configured plugin entries to plugin.Spec
 // and injects runtime policy such as the global MCP call timeout.
 func PluginSpecsForRootWithOptions(entries []config.PluginEntry, workspaceRoot string, opts PluginSpecOptions) []plugin.Spec {
@@ -2831,6 +2866,7 @@ func pluginSpecFromEntryWithOptions(e config.PluginEntry, workspaceRoot string, 
 		LaunchManager:         opts.LaunchManager,
 		ConfigSource:          configSource,
 		Authorized:            e.Source.UserAuthorized(),
+		OAuthHTTPClient:       opts.OAuthHTTPClient,
 	}, workspaceRoot)
 	if e.Source.ProjectScoped() && strings.TrimSpace(spec.Dir) == "" {
 		spec.Dir = workspaceRoot
