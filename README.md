@@ -11,7 +11,6 @@
 
 <p align="center">
   <a href="https://github.com/Junjie88/Reasionix-SupportVisionModel/tree/main-v2"><img src="https://img.shields.io/badge/branch-main--v2-2f81f7?style=flat-square" alt="main-v2 branch"/></a>
-  <a href="https://linux.do/"><img src="https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LinuxDO-yellow" alt="Linux DO community"/></a>
   <a href="https://github.com/esengine/DeepSeek-Reasonix"><img src="https://img.shields.io/badge/upstream-Reasonix-3fb950?style=flat-square" alt="Reasonix upstream"/></a>
 </p>
 
